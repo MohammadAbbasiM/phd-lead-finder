@@ -26,35 +26,140 @@ else:
 
 SEARCH_GROUPS = [
     (
-        "FPGA & Edge AI",
+        "Visual-Inertial Navigation & SLAM",
         [
-            "FPGA neural network accelerator", "deep learning FPGA", "TinyML",
-            "embedded machine learning", "hardware accelerator VHDL",
-            "low-power digital systems", "edge AI computing", "digital signal processing FPGA"
+            "visual inertial odometry",
+            "visual inertial navigation",
+            "visual SLAM",
+            "visual-inertial SLAM",
+            "visual odometry",
+            "camera IMU fusion",
+            "inertial navigation"
         ]
     ),
+
     (
-        "Vision & Autonomous Systems",
+        "Robotics & Autonomous Navigation",
         [
-            "autonomous vehicle perception", "CARLA autonomous simulation",
-            "deep learning object detection", "computer vision embedded",
-            "camera LiDAR sensor fusion", "autonomous driving perception"
+            "robot localization",
+            "autonomous navigation",
+            "mobile robot navigation",
+            "robot perception",
+            "autonomous robotics",
+            "field robotics",
+            "outdoor robotics"
         ]
     ),
+
     (
-        "Biomedical & Acoustic Signals",
+        "GNSS & Multi-Sensor Navigation",
         [
-            "otoacoustic emissions", "biomedical signal processing",
-            "auditory diagnostic signal", "medical image deep learning",
-            "hearing screening sensor", "bio-signal classification"
+            "GNSS positioning",
+            "GNSS navigation",
+            "GNSS INS integration",
+            "GNSS sensor fusion",
+            "multi-sensor fusion",
+            "robust localization",
+            "precise positioning"
         ]
     ),
+
     (
-        "Sensor Fusion & DAQ",
+        "Computer Vision & 3D Perception",
         [
-            "inertial sensor fusion", "real-time data acquisition FPGA",
-            "multi-sensor orientation tracking", "embedded telemetry systems",
-            "sun sensor optical tracking", "IMU state estimation"
+            "computer vision robotics",
+            "3D computer vision",
+            "visual perception",
+            "3D perception",
+            "visual localization",
+            "depth estimation",
+            "stereo vision"
+        ]
+    ),
+
+    (
+        "LiDAR & Multimodal Sensor Fusion",
+        [
+            "LiDAR camera fusion",
+            "LiDAR inertial fusion",
+            "LiDAR visual odometry",
+            "LiDAR SLAM",
+            "multimodal sensor fusion",
+            "camera LiDAR IMU"
+        ]
+    ),
+
+    (
+        "State Estimation & Optimization",
+        [
+            "state estimation robotics",
+            "pose estimation",
+            "trajectory estimation",
+            "factor graph optimization",
+            "nonlinear optimization robotics",
+            "probabilistic robotics",
+            "Kalman filtering robotics"
+        ]
+    ),
+
+    (
+        "Machine Learning for Robotics & Perception",
+        [
+            "deep learning robotics",
+            "machine learning robotics",
+            "deep learning computer vision",
+            "self-supervised visual navigation",
+            "learning-based localization",
+            "neural visual odometry",
+            "learning-based perception"
+        ]
+    ),
+
+    (
+        "Autonomous Vehicles & Intelligent Systems",
+        [
+            "autonomous vehicles",
+            "autonomous driving perception",
+            "vehicle localization",
+            "intelligent transportation systems",
+            "robotic navigation",
+            "autonomous systems perception"
+        ]
+    ),
+
+    (
+        "Embedded AI & Edge Robotics",
+        [
+            "embedded AI robotics",
+            "edge AI robotics",
+            "real-time computer vision",
+            "GPU accelerated robotics",
+            "embedded computer vision",
+            "AI acceleration robotics",
+            "Jetson robotics"
+        ]
+    ),
+
+    (
+        "Medical Image Computing",
+        [
+            "medical image segmentation",
+            "medical image processing",
+            "deep learning medical imaging",
+            "computer vision medical imaging",
+            "image segmentation"
+        ]
+    ),
+
+    (
+        "Embedded Systems & Digital Hardware",
+        [
+            "embedded systems",
+            "embedded AI",
+            "FPGA neural network accelerator",
+            "hardware acceleration",
+            "digital hardware design",
+            "real-time embedded systems"
         ]
     )
 ]
