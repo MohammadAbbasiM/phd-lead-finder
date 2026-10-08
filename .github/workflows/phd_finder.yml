@@ -2,19 +2,24 @@ name: Discover Professors (Daily Batch of 5)
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # Runs automatically every 24 hours at 08:00 UTC
-  workflow_dispatch:      # Allows manual click anytime
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: professor-discovery
+  cancel-in-progress: false
 
 jobs:
   run-lead-finder:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # Explicit write permission to push commits
+      contents: write
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetches complete history so rebase works seamlessly
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -34,8 +39,14 @@ jobs:
 
       - name: Commit and push updated file back to repo
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git pull origin main --rebase || true
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           git add "List of emails.xlsx" "List of emails.xlsx - Sheet1.csv" 2>/dev/null || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update general field leads [skip ci]" && git push origin main)
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update general field leads [skip ci]"
+            git push origin main
+          fi
