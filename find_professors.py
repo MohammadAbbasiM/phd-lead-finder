@@ -2,8 +2,10 @@ import os
 import re
 import time
 import html
+import unicodedata
 import requests
 import pandas as pd
+from openpyxl import load_workbook
 
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
@@ -349,7 +351,7 @@ def clean_university_name(name):
     Clean Excel annotations without incorrectly splitting legitimate names such as
     'University of Science and Technology of China'.
     """
-    name = str(name).strip()
+    name = str(name or "").strip()
     name = re.sub(r"\s+", " ", name)
     name = re.sub(r"\([^)]*\)", "", name).strip()
 
@@ -357,12 +359,51 @@ def clean_university_name(name):
     name = re.sub(r"\s*-\s*3years?\s+phd\s+programs?.*$", "", name, flags=re.I)
     name = re.sub(r"\s*\(\s*3years?\s+phd programs?\s*\)\s*$", "", name, flags=re.I)
 
-    # "ETH Zürich and Bologna" is not a single OpenAlex institution.
-    # In that special case, search the first institution.
+    # Known annotation in the user's sheet.
     if normalize_name(name) == normalize_name("ETH Zürich and Bologna"):
         name = "ETH Zürich"
 
     return name.strip(" -")
+
+
+# Canonical aliases used ONLY for duplicate detection / batch selection.
+# The original Excel text is preserved in the University column.
+UNIVERSITY_ALIASES = {
+    "eth zurich": "eth zurich",
+    "eth zürich": "eth zurich",
+    "eth zurich and bologna": "eth zurich",
+    "technical university of munich": "technical university of munich",
+    "technical university of munich tum": "technical university of munich",
+    "tu munich": "technical university of munich",
+    "rwth aachen": "rwth aachen university",
+    "rwth aachen university": "rwth aachen university",
+    "delft university of technology": "delft university of technology",
+    "tu delft": "delft university of technology",
+    "eindhoven university of technology": "eindhoven university of technology",
+    "tu eindhoven": "eindhoven university of technology",
+    "university of twente": "university of twente",
+    "radbound university": "radboud university",
+    "radboud university": "radboud university",
+    "national university of singapore nus": "national university of singapore",
+    "national university of singapore": "national university of singapore",
+    "nanyang technological university singapore ntu singapore": "nanyang technological university singapore",
+    "nanyang technological university singapore": "nanyang technological university singapore",
+}
+
+
+def university_key(name):
+    """Return a stable key so duplicates are processed once per run."""
+    cleaned = clean_university_name(name)
+    normalized = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
+    normalized = normalize_name(normalized)
+    normalized = re.sub(r"^the\s+", "", normalized)
+    normalized = re.sub(r"\b(university|universitaet|university)\b\s*$", "university", normalized)
+    return UNIVERSITY_ALIASES.get(normalized, normalized)
+
+
+def duplicate_indices_for_university(df, key):
+    """Return every row representing the same university key."""
+    return [idx for idx in df.index if university_key(df.at[idx, "University"]) == key]
 
 
 def reconstruct_abstract(inverted_index):
@@ -1129,11 +1170,113 @@ def update_dataframe_row(df, idx, result):
     df.at[idx, "Note"] = first["profile_url"]
 
 
-def save_dataframe(df):
+def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
+    """Apply practical formatting so each faculty is readable row-by-row."""
+    try:
+        wb = load_workbook(file_name)
+        for ws in wb.worksheets:
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            ws.sheet_view.showGridLines = False
+
+            # Sensible widths; cap very long text columns.
+            for col_cells in ws.columns:
+                values = [str(c.value or "") for c in col_cells[:50]]
+                width = min(max(max((len(v) for v in values), default=10) + 2, 12), 42)
+                ws.column_dimensions[col_cells[0].column_letter].width = width
+
+            # Extra room for detailed narrative cells.
+            for col in ws.iter_cols(1, ws.max_column):
+                header = str(col[0].value or "")
+                if "Details" in header or "Evidence" in header:
+                    ws.column_dimensions[col[0].column_letter].width = 55
+                    for cell in col[1:]:
+                        cell.alignment = cell.alignment.copy(wrap_text=True, vertical="top")
+
+        wb.save(file_name)
+    except Exception as exc:
+        print(f"[!] Excel styling skipped: {exc}")
+
+
+def build_faculty_rows(processed_results):
+    """One faculty member per row for clean Excel filtering/sorting."""
+    rows = []
+    for result in processed_results:
+        institution = result.get("institution") or {}
+        uni = result.get("university", "")
+        faculty = result.get("faculty", [])
+
+        if not faculty:
+            rows.append({
+                "University": uni,
+                "Faculty_Rank": "",
+                "Professor": "",
+                "University_OpenAlex": institution.get("display_name", ""),
+                "Research_Fit": 0,
+                "Activity": 0,
+                "Funding_Evidence": 0,
+                "Overall_Score": 0,
+                "Research_Areas": "",
+                "Matched_Works": 0,
+                "Recent_Works": 0,
+                "Latest_Publication": "",
+                "Best_Paper": "",
+                "Paper_Year": "",
+                "Funding_Evidence_Details": "",
+                "OpenAlex_Profile": "",
+                "Homepage": "",
+            })
+            continue
+
+        for rank, item in enumerate(faculty, start=1):
+            rows.append({
+                "University": uni,
+                "Faculty_Rank": rank,
+                "Professor": item.get("professor", ""),
+                "University_OpenAlex": institution.get("display_name", ""),
+                "Research_Fit": item.get("research_fit_score", 0),
+                "Activity": item.get("activity_score", 0),
+                "Funding_Evidence": item.get("funding_score", 0),
+                "Overall_Score": item.get("faculty_score", 0),
+                "Research_Areas": "; ".join(item.get("fields", [])[:3]),
+                "Matched_Works": item.get("matched_works_count", 0),
+                "Recent_Works": item.get("recent_works_count", 0),
+                "Latest_Publication": item.get("latest_publication", ""),
+                "Best_Paper": item.get("paper", ""),
+                "Paper_Year": item.get("year", ""),
+                "Funding_Evidence_Details": item.get("funding_evidence", ""),
+                "OpenAlex_Profile": item.get("profile_url", ""),
+                "Homepage": item.get("homepage_url", ""),
+            })
+    return pd.DataFrame(rows)
+
+
+def save_outputs(df, processed_results):
+    """Save the university tracker plus a row-by-row Faculty Results sheet."""
+    faculty_df = build_faculty_rows(processed_results)
+
     if FILE_NAME.endswith(".csv"):
         df.to_csv(FILE_NAME, index=False)
-    else:
-        df.to_excel(FILE_NAME, index=False)
+        faculty_file = "Faculty Results.csv"
+        faculty_df.to_csv(faculty_file, index=False)
+        return faculty_file
+
+    # Preserve the existing workbook and all unrelated sheets.
+    wb = load_workbook(FILE_NAME)
+    main_sheet_name = wb.sheetnames[0] if wb.sheetnames else "Sheet1"
+    wb.close()
+
+    with pd.ExcelWriter(
+        FILE_NAME,
+        engine="openpyxl",
+        mode="a",
+        if_sheet_exists="replace",
+    ) as writer:
+        df.to_excel(writer, sheet_name=main_sheet_name, index=False)
+        faculty_df.to_excel(writer, sheet_name="Faculty Results", index=False)
+
+    style_excel_workbook(FILE_NAME, main_sheet_name)
+    return FILE_NAME
 
 
 # ==============================================================================
@@ -1141,72 +1284,74 @@ def save_dataframe(df):
 # ==============================================================================
 
 def build_university_report(universities, all_matches):
-    if not all_matches:
-        listed = "\n".join(
-            f"• {html.escape(u)}" for u in universities
-        )
-        return (
-            "🔎 <b>Faculty Finder v2</b>\n\n"
-            "Checked universities:\n"
-            f"{listed}\n\n"
-            "No high-quality faculty matches were found in this cycle."
-        )
+    """Build multiple short Telegram messages; never silently truncate the report."""
+    chunks = []
+    current = ["🎯 <b>Faculty Finder v3 — Faculty Matches</b>", ""]
 
-    lines = [
-        "🎯 <b>Faculty Finder v2 — Top Faculty Matches</b>",
-        "",
-    ]
+    def flush():
+        nonlocal current
+        if current and len("\n".join(current)) > 0:
+            chunks.append("\n".join(current))
+        current = []
 
-    for uni_result in all_matches:
-        uni_name = uni_result["university"]
-        faculty = uni_result["faculty"]
+    results_by_key = {university_key(item.get("university", "")): item for item in all_matches}
 
+    for uni_name in universities:
+        uni_result = results_by_key.get(university_key(uni_name), {"university": uni_name, "faculty": []})
+        faculty = uni_result.get("faculty", [])
+
+        lines = [f"🏛 <b>{html.escape(uni_name)}</b>"]
         if not faculty:
-            lines.append(f"🏛 <b>{html.escape(uni_name)}</b> — no strong matches")
-            lines.append("")
-            continue
+            lines.append("   No strong faculty match found.")
+            lines.append("─" * 28)
+        else:
+            top_n = faculty[:MAX_FACULTY_PER_UNIVERSITY]
+            research = sum(x["research_fit_score"] for x in top_n) / len(top_n)
+            activity = sum(x["activity_score"] for x in top_n) / len(top_n)
+            funding = sum(x["funding_score"] for x in top_n) / len(top_n)
+            university_score = 0.60 * research + 0.20 * activity + 0.20 * funding
 
-        top_n = faculty[:MAX_FACULTY_PER_UNIVERSITY]
-        research = sum(x["research_fit_score"] for x in top_n) / len(top_n)
-        activity = sum(x["activity_score"] for x in top_n) / len(top_n)
-        funding = sum(x["funding_score"] for x in top_n) / len(top_n)
-        university_score = (
-            0.60 * research + 0.20 * activity + 0.20 * funding
-        )
+            lines.extend([
+                f"   ⭐ University score: <b>{university_score:.1f}/10</b>",
+                f"   🎯 Research: {research:.1f} | 📚 Activity: {activity:.1f} | 💰 Funding evidence: {funding:.1f}",
+                "",
+            ])
 
-        lines.append(
-            f"🏛 <b>{html.escape(uni_name)}</b>\n"
-            f"⭐ University score: <b>{university_score:.1f}/10</b>\n"
-            f"🎯 Research: {research:.1f} | "
-            f"📚 Activity: {activity:.1f} | "
-            f"💰 Funding evidence: {funding:.1f}"
-        )
+            for rank, item in enumerate(top_n, start=1):
+                professor = html.escape(item.get("professor", ""))
+                fields = html.escape(", ".join(item.get("fields", [])[:2]))
+                paper = html.escape(item.get("paper", "")[:85])
+                evidence = html.escape(item.get("funding_evidence", "No explicit evidence")[:110])
+                profile = html.escape(item.get("profile_url", ""))
 
-        for idx, item in enumerate(top_n, start=1):
-            profile_url = item["profile_url"]
-            professor = html.escape(item["professor"])
-            fields = html.escape(", ".join(item["fields"][:2]))
-            paper = html.escape(item["paper"][:90])
-            funding_evidence = html.escape(item["funding_evidence"][:130])
+                lines.extend([
+                    f"{rank}. <b>{professor}</b>",
+                    f"   Fit: {item['research_fit_score']:.1f} | Activity: {item['activity_score']:.1f} | Funding: {item['funding_score']:.1f} | Overall: <b>{item['faculty_score']:.1f}/10</b>",
+                    f"   Area: {fields}",
+                    f"   Paper: <i>{paper}</i> ({item.get('year', '')})",
+                    f"   Funding: {evidence}",
+                    f"   <a href=\"{profile}\">OpenAlex profile</a>",
+                    "",
+                ])
 
-            lines.append(
-                f"\n{idx}. <b>{professor}</b>\n"
-                f"   Fit: {item['research_fit_score']:.1f} | "
-                f"Activity: {item['activity_score']:.1f} | "
-                f"Funding: {item['funding_score']:.1f} | "
-                f"Overall: <b>{item['faculty_score']:.1f}/10</b>\n"
-                f"   Area: {fields}\n"
-                f"   Paper: <i>{paper}</i>\n"
-                f"   Funding evidence: {funding_evidence}\n"
-                f"   <a href=\"{html.escape(profile_url)}\">OpenAlex profile</a>"
-            )
+            lines.append("─" * 28)
 
-        lines.append("\n" + "─" * 28)
+        block = "\n".join(lines)
+        # Keep a conservative margin below Telegram's 4096-char limit.
+        if len("\n".join(current + [block])) > 3500:
+            flush()
+            current = ["🎯 <b>Faculty Finder v3 — continued</b>", "", block]
+        else:
+            current.append(block)
 
-    message = "\n".join(lines)
+    flush()
+    return chunks
 
-    # Telegram message limit is ~4096 characters.
-    return message[:3950]
+
+def send_report_chunks(chunks):
+    for chunk in chunks:
+        send_telegram_html(chunk)
+        time.sleep(0.4)
 
 
 # ==============================================================================
@@ -1214,7 +1359,7 @@ def build_university_report(universities, all_matches):
 # ==============================================================================
 
 def main():
-    print("🚀 Running Faculty Finder v2...")
+    print("🚀 Running Faculty Finder v3...")
     print(f"Loading file: {FILE_NAME}")
 
     if not os.path.exists(FILE_NAME):
@@ -1224,8 +1369,12 @@ def main():
     try:
         if FILE_NAME.endswith(".csv"):
             df = pd.read_csv(FILE_NAME)
+            original_sheet_name = None
         else:
             df = pd.read_excel(FILE_NAME)
+            wb = load_workbook(FILE_NAME, read_only=True)
+            original_sheet_name = wb.sheetnames[0] if wb.sheetnames else "Sheet1"
+            wb.close()
     except Exception as exc:
         print(f"[!] Failed to read tracking file: {exc}")
         return
@@ -1236,90 +1385,115 @@ def main():
 
     df = ensure_output_columns(df)
 
+    # Only process unchecked rows, but collapse duplicates to UNIQUE universities.
     mask = (
         df["University"].notna()
         & (df["University"].astype(str).str.strip() != "")
         & (df["University"].astype(str).str.lower() != "nan")
-        & (
-            df["Checked_General?"]
-            .astype(str)
-            .str.upper()
-            != "YES"
-        )
+        & (df["Checked_General?"].astype(str).str.upper() != "YES")
     )
 
-    pending_rows = df[mask]
+    seen_keys = set()
+    unique_batch = []
+    for idx in df.index[mask]:
+        raw_name = str(df.at[idx, "University"]).strip()
+        key = university_key(raw_name)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_batch.append((key, raw_name))
+        if len(unique_batch) >= BATCH_SIZE:
+            break
 
-    if pending_rows.empty:
-        print("[✓] All universities checked.")
-        send_telegram_html(
-            "🎉 <b>Faculty Finder v2:</b> all universities have been processed."
-        )
+    if not unique_batch:
+        print("[✓] All unique universities have been checked.")
+        send_telegram_html("🎉 <b>Faculty Finder v3:</b> all unique universities have been processed.")
         return
 
-    batch = pending_rows.head(BATCH_SIZE)
-    universities = [str(u).strip() for u in batch["University"].tolist()]
-
-    print(f"Processing batch of {len(universities)}: {universities}")
+    print(f"\nProcessing {len(unique_batch)} UNIQUE universities (duplicates collapsed):")
+    for number, (_, uni) in enumerate(unique_batch, start=1):
+        duplicate_count = len(duplicate_indices_for_university(df, university_key(uni)))
+        suffix = f" ({duplicate_count} rows in sheet)" if duplicate_count > 1 else ""
+        print(f"  {number}. {uni}{suffix}")
 
     all_matches = []
+    successful_count = 0
+    failed_count = 0
 
-    for idx, row in batch.iterrows():
-        raw_uni = str(row["University"]).strip()
-
-        print("\n" + "=" * 72)
-        print(f"🏛 {raw_uni}")
+    for batch_pos, (uni_key, raw_uni) in enumerate(unique_batch, start=1):
+        print("\n" + "=" * 88)
+        print(f"🏛 [{batch_pos}/{len(unique_batch)}] {raw_uni}")
+        print("=" * 88)
 
         result = search_faculty_broad(raw_uni)
 
         if not result["ok"]:
-            print(f"[!] Search failed for {raw_uni}; leaving row unchecked.")
+            print(f"[!] Search failed for {raw_uni}; leaving its rows unchecked.")
+            failed_count += 1
             continue
 
-        all_matches.append(
-            {
-                "university": raw_uni,
-                "faculty": result["faculty"],
-            }
-        )
+        successful_count += 1
+        all_matches.append({
+            "university": raw_uni,
+            "institution": result.get("institution") or {},
+            "faculty": result.get("faculty", []),
+        })
 
-        update_dataframe_row(df, idx, result)
-        df.at[idx, "Checked_General?"] = "YES"
+        # IMPORTANT: update ALL duplicate rows for this university in one pass.
+        matching_indices = duplicate_indices_for_university(df, uni_key)
+        for idx in matching_indices:
+            update_dataframe_row(df, idx, result)
+            df.at[idx, "Checked_General?"] = "YES"
+
+        print(f"[✓] Updated {len(matching_indices)} spreadsheet row(s) for {raw_uni}.")
 
         if result["faculty"]:
-            best = result["faculty"][0]
-            print(
-                f"[✓] Best faculty: {best['professor']} | "
-                f"Research {best['research_fit_score']:.1f} | "
-                f"Activity {best['activity_score']:.1f} | "
-                f"Funding {best['funding_score']:.1f} | "
-                f"Overall {best['faculty_score']:.1f}"
-            )
+            print(f"[✓] Top {min(len(result['faculty']), MAX_FACULTY_PER_UNIVERSITY)} faculty:")
+            for rank, faculty in enumerate(result["faculty"], start=1):
+                print(
+                    f"   {rank}. {faculty['professor']} | "
+                    f"Fit={faculty['research_fit_score']:.1f} | "
+                    f"Activity={faculty['activity_score']:.1f} | "
+                    f"Funding={faculty['funding_score']:.1f} | "
+                    f"Overall={faculty['faculty_score']:.1f} | "
+                    f"{faculty['field']}"
+                )
         else:
             print("[–] No strong faculty match found.")
 
         time.sleep(0.5)
 
-    # Save progress even if one university failed.
+    # Save progress even if some universities failed.
     try:
-        save_dataframe(df)
-        print(f"[✓] Tracking file updated: {FILE_NAME}")
+        faculty_file = save_outputs(df, all_matches)
+        print(f"\n[✓] Tracking output updated: {FILE_NAME}")
+        if faculty_file != FILE_NAME:
+            print(f"[✓] Row-by-row faculty output: {faculty_file}")
     except Exception as exc:
-        print(f"[!] Failed to save tracking file: {exc}")
+        print(f"[!] Failed to save output files: {exc}")
         return
 
-    # Telegram report.
-    report = build_university_report(universities, all_matches)
-    send_telegram_html(report)
+    # Telegram: multiple messages so no university/faculty block is silently cut.
+    universities = [uni for _, uni in unique_batch]
+    report_chunks = build_university_report(universities, all_matches)
+    send_report_chunks(report_chunks)
 
-    # Send updated sheet.
     send_telegram_document(
         FILE_NAME,
-        caption="💾 Updated Faculty Finder v2 tracking sheet.",
+        caption=(
+            f"💾 Faculty Finder v3 updated sheet | "
+            f"Processed: {successful_count}/{len(unique_batch)} unique universities | "
+            f"Failed: {failed_count}"
+        ),
     )
 
-    print("✅ Run complete.")
+    if FILE_NAME.endswith(".csv") and os.path.exists("Faculty Results.csv"):
+        send_telegram_document(
+            "Faculty Results.csv",
+            caption="📋 Row-by-row faculty results (one professor per row).",
+        )
 
+    print("\n✅ Run complete.")
 
 if __name__ == "__main__":
     main()
