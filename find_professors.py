@@ -37,13 +37,18 @@ else:
 
 BATCH_SIZE = 5
 MAX_FACULTY_PER_UNIVERSITY = 5
+MIN_RESEARCH_FIT_SCORE = 2.5  # حداقل امتیاز تناسب پژوهشی برای گزارش شدن استاد
+
+# Minimum author profile thresholds to filter out undergraduate/PhD students
+MIN_AUTHOR_WORKS_COUNT = 12
+MIN_AUTHOR_H_INDEX = 4
 
 # Recent publication window.
 RECENT_YEARS = 5
 
 # Search breadth.
 WORKS_PER_GROUP = 15
-MAX_CANDIDATE_AUTHORS = 20
+MAX_CANDIDATE_AUTHORS = 25
 MAX_WORKS_FOR_FIT = 10
 
 # Optional homepage crawl for funding evidence.
@@ -58,9 +63,6 @@ OPENALEX_EMAIL = "phd-lead-finder@academic.org"
 # CANDIDATE RESEARCH PROFILE
 # ==============================================================================
 
-# Strong terms receive much larger weights than generic AI/ML/robotics terms.
-# This is deliberately asymmetric: a professor doing VIO should outrank
-# someone doing generic machine learning.
 SEARCH_GROUPS = [
     (
         "Visual-Inertial Navigation & SLAM",
@@ -138,7 +140,6 @@ SEARCH_GROUPS = [
         [
             "deep learning robotics",
             "machine learning robotics",
-            "deep learning computer vision",
             "self-supervised visual navigation",
             "learning-based localization",
             "neural visual odometry",
@@ -168,31 +169,8 @@ SEARCH_GROUPS = [
             "Jetson robotics",
         ],
     ),
-    (
-        "Medical Image Computing",
-        [
-            "medical image segmentation",
-            "medical image processing",
-            "deep learning medical imaging",
-            "computer vision medical imaging",
-            "image segmentation",
-        ],
-    ),
-    (
-        "Embedded Systems & Digital Hardware",
-        [
-            "embedded systems",
-            "embedded AI",
-            "FPGA neural network accelerator",
-            "hardware acceleration",
-            "digital hardware design",
-            "real-time embedded systems",
-        ],
-    ),
 ]
 
-# Explicitly weighted research concepts.
-# Lower-weight generic terms prevent "AI", "robotics", etc. from dominating.
 TIER1_PHRASES = {
     "visual inertial odometry": 10.0,
     "visual inertial navigation": 10.0,
@@ -241,8 +219,8 @@ TIER2_PHRASES = {
 }
 
 TIER3_PHRASES = {
-    "deep learning": 2.5,
-    "machine learning": 2.0,
+    "deep learning": 2.0,
+    "machine learning": 1.5,
     "computer vision": 2.0,
     "object detection": 2.0,
     "object tracking": 2.0,
@@ -260,7 +238,6 @@ RESEARCH_PROFILE_TEXT = " ".join(
     phrase for _, phrases in SEARCH_GROUPS for phrase in phrases
 )
 
-# Funding phrases only count as evidence when found on a faculty/homepage page.
 FUNDING_HIGH = [
     "fully funded phd",
     "funded phd",
@@ -272,6 +249,8 @@ FUNDING_HIGH = [
     "funded positions",
     "phd opportunity",
     "phd opportunities",
+    "open phd position",
+    "open positions",
 ]
 
 FUNDING_MEDIUM = [
@@ -283,6 +262,8 @@ FUNDING_MEDIUM = [
     "research assistant",
     "scholarship",
     "studentship",
+    "prospective students",
+    "join us",
 ]
 
 # ==============================================================================
@@ -292,7 +273,7 @@ FUNDING_MEDIUM = [
 session = requests.Session()
 session.headers.update(
     {
-        "User-Agent": f"Mozilla/5.0 PhDLeadFinder/2.0 (+mailto:{OPENALEX_EMAIL})",
+        "User-Agent": f"Mozilla/5.0 PhDLeadFinder/3.1 (+mailto:{OPENALEX_EMAIL})",
         "Accept-Language": "en-US,en;q=0.9",
     }
 )
@@ -347,34 +328,30 @@ def normalize_name(value):
 
 
 def clean_university_name(name):
-    """
-    Clean Excel annotations without incorrectly splitting legitimate names such as
-    'University of Science and Technology of China'.
-    """
+    """Clean Excel annotations, notes, and parenthetical text."""
     name = str(name or "").strip()
     name = re.sub(r"\s+", " ", name)
     name = re.sub(r"\([^)]*\)", "", name).strip()
 
-    # Remove common spreadsheet notes after separators.
-    name = re.sub(r"\s*-\s*3years?\s+phd\s+programs?.*$", "", name, flags=re.I)
-    name = re.sub(r"\s*\(\s*3years?\s+phd programs?\s*\)\s*$", "", name, flags=re.I)
+    # Remove common spreadsheet notes after separators (- or – or —).
+    name = re.sub(r"\s*[-–—]\s*\d+\s*years?\s+phd.*$", "", name, flags=re.I)
+    name = re.sub(r"\s*[-–—]\s*(phd|master|msc|department|faculty|school).*$", "", name, flags=re.I)
 
-    # Known annotation in the user's sheet.
     if normalize_name(name) == normalize_name("ETH Zürich and Bologna"):
         name = "ETH Zürich"
 
-    return name.strip(" -")
+    return name.strip(" -–—,;/")
 
 
-# Canonical aliases used ONLY for duplicate detection / batch selection.
-# The original Excel text is preserved in the University column.
 UNIVERSITY_ALIASES = {
     "eth zurich": "eth zurich",
     "eth zürich": "eth zurich",
     "eth zurich and bologna": "eth zurich",
+    "swiss federal institute of technology zurich": "eth zurich",
     "technical university of munich": "technical university of munich",
     "technical university of munich tum": "technical university of munich",
     "tu munich": "technical university of munich",
+    "technische universitat munchen": "technical university of munich",
     "rwth aachen": "rwth aachen university",
     "rwth aachen university": "rwth aachen university",
     "delft university of technology": "delft university of technology",
@@ -388,22 +365,31 @@ UNIVERSITY_ALIASES = {
     "national university of singapore": "national university of singapore",
     "nanyang technological university singapore ntu singapore": "nanyang technological university singapore",
     "nanyang technological university singapore": "nanyang technological university singapore",
+    "nanyang technological university": "nanyang technological university singapore",
+    "epfl": "ecole polytechnique federale de lausanne",
+    "katholieke universiteit leuven": "ku leuven",
 }
 
 
 def university_key(name):
-    """Return a stable key so duplicates are processed once per run."""
+    """Return a canonical key so duplicates are collapsed across the entire sheet."""
     cleaned = clean_university_name(name)
     normalized = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
     normalized = normalize_name(normalized)
     normalized = re.sub(r"^the\s+", "", normalized)
-    normalized = re.sub(r"\b(university|universitaet|university)\b\s*$", "university", normalized)
+    normalized = re.sub(r"\b(universitaet|universitat|universite|universidad|universita)\b", "university", normalized)
     return UNIVERSITY_ALIASES.get(normalized, normalized)
 
 
 def duplicate_indices_for_university(df, key):
-    """Return every row representing the same university key."""
+    """Return every row index representing the same university key."""
     return [idx for idx in df.index if university_key(df.at[idx, "University"]) == key]
+
+
+def contains_whole_phrase(text, phrase):
+    """Match whole words/phrases only, avoiding false substrings like 'ros' in 'across'."""
+    pattern = r"\b" + re.escape(phrase) + r"\b"
+    return bool(re.search(pattern, text))
 
 
 def reconstruct_abstract(inverted_index):
@@ -440,27 +426,35 @@ def work_text(work):
 
 def phrase_score(text):
     """
-    Weighted phrase matching.
-    Tier-1 navigation concepts dominate generic AI/ML keywords.
+    Weighted phrase matching using word boundaries (\b).
+    Requires at least one Tier-1 or Tier-2 match to count Tier-3 generic terms.
     """
     lower = normalize_name(text)
     total = 0.0
     matched = []
+    has_core_match = False
 
-    all_phrases = [
-        ("T1", TIER1_PHRASES),
-        ("T2", TIER2_PHRASES),
-        ("T3", TIER3_PHRASES),
-    ]
-
-    for tier, mapping in all_phrases:
+    for tier, mapping in [("T1", TIER1_PHRASES), ("T2", TIER2_PHRASES)]:
         for phrase, weight in mapping.items():
             normalized_phrase = normalize_name(phrase)
-            if normalized_phrase in lower:
+            if contains_whole_phrase(lower, normalized_phrase):
                 total += weight
                 matched.append((phrase, weight, tier))
+                has_core_match = True
 
-    # Mild bonus for explicitly strong combinations.
+    # Only add generic Tier-3 terms if the paper has some core relevance or multiple Tier-3 hits
+    t3_hits = []
+    for phrase, weight in TIER3_PHRASES.items():
+        normalized_phrase = normalize_name(phrase)
+        if contains_whole_phrase(lower, normalized_phrase):
+            t3_hits.append((phrase, weight, "T3"))
+
+    if has_core_match or len(t3_hits) >= 2:
+        for item in t3_hits:
+            total += item[1]
+            matched.append(item)
+
+    # Bonus for explicitly strong word-bounded combinations.
     combo_pairs = [
         ("gnss", "sensor fusion"),
         ("camera", "imu"),
@@ -470,7 +464,7 @@ def phrase_score(text):
         ("factor graph", "navigation"),
     ]
     for a, b in combo_pairs:
-        if a in lower and b in lower:
+        if contains_whole_phrase(lower, a) and contains_whole_phrase(lower, b):
             total += 2.0
 
     matched.sort(key=lambda x: x[1], reverse=True)
@@ -478,15 +472,7 @@ def phrase_score(text):
 
 
 def tfidf_similarity(profile_text, texts):
-    """
-    TF-IDF similarity is used as a lightweight semantic-text similarity layer.
-    It is optional; if scikit-learn is unavailable, the algorithm falls back
-    to weighted phrase matching.
-    """
-    if not texts:
-        return []
-
-    if not HAS_SKLEARN:
+    if not texts or not HAS_SKLEARN:
         return [0.0 for _ in texts]
 
     try:
@@ -541,8 +527,8 @@ def recency_factor(publication_date):
 # ==============================================================================
 
 def institution_name_similarity(query_name, candidate_name):
-    q = normalize_name(query_name)
-    c = normalize_name(candidate_name)
+    q = university_key(query_name)
+    c = university_key(candidate_name)
 
     q_tokens = set(q.split())
     c_tokens = set(c.split())
@@ -613,16 +599,59 @@ def author_belongs_to_institution(authorship, institution_id):
     return False
 
 
-def search_faculty_broad(raw_uni_name):
+def author_currently_at_institution(author_data, target_inst_id):
     """
-    Returns:
-      {
-        "ok": bool,
-        "institution": dict,
-        "faculty": [faculty_record, ...]
-      }
+    Verify if the author is STILL affiliated with the target university.
+    Filters out graduated PhD students or visiting researchers who left.
     """
-    institution = resolve_institution(raw_uni_name)
+    if not author_data:
+        return True
+
+    target_short = target_inst_id.rstrip("/").split("/")[-1]
+
+    last_insts = author_data.get("last_known_institutions") or []
+    if last_insts:
+        for inst in last_insts:
+            inst_id = (inst.get("id") or "").rstrip("/").split("/")[-1]
+            if inst_id == target_short:
+                return True
+        return False
+
+    # Fallback to affiliations history if last_known_institutions is empty
+    affiliations = author_data.get("affiliations") or []
+    current_year = datetime.now(timezone.utc).year
+    for aff in affiliations:
+        inst = aff.get("institution") or {}
+        inst_id = (inst.get("id") or "").rstrip("/").split("/")[-1]
+        years = aff.get("years") or []
+        if inst_id == target_short and any(y >= current_year - 2 for y in years):
+            return True
+
+    return True
+
+
+def is_likely_faculty(author_data, senior_paper_count):
+    """
+    Filter out junior students by checking publication volume, h-index,
+    and whether they appear as last/corresponding author.
+    """
+    if not author_data:
+        return senior_paper_count >= 1
+
+    works_count = author_data.get("works_count", 0) or 0
+    summary = author_data.get("summary_stats") or {}
+    h_index = summary.get("h_index", 0) or 0
+
+    if works_count >= MIN_AUTHOR_WORKS_COUNT and h_index >= MIN_AUTHOR_H_INDEX:
+        return True
+    if senior_paper_count >= 2 and works_count >= 8:
+        return True
+    return False
+
+
+def search_faculty_broad(raw_uni_name, institution=None):
+    if not institution:
+        institution = resolve_institution(raw_uni_name)
 
     if not institution:
         return {"ok": False, "institution": None, "faculty": []}
@@ -646,7 +675,6 @@ def search_faculty_broad(raw_uni_name):
                 "search": query_str,
                 "sort": "relevance_score:desc,publication_date:desc",
                 "per_page": WORKS_PER_GROUP,
-                # Keep payload reasonably small.
                 "select": (
                     "id,title,publication_date,publication_year,"
                     "authorships,abstract_inverted_index,topics,keywords,"
@@ -663,7 +691,6 @@ def search_faculty_broad(raw_uni_name):
             if not work_id:
                 continue
 
-            # Keep the work once, but remember every matched group.
             if work_id not in all_works:
                 all_works[work_id] = {
                     "work": work,
@@ -684,18 +711,14 @@ def search_faculty_broad(raw_uni_name):
         text = texts[idx]
 
         weighted_score, matched = phrase_score(text)
-        # Normalize weighted phrase score into 0..1.
-        # 45 is a deliberately high "excellent direct fit" reference point.
-        keyword_norm = min(weighted_score / 45.0, 1.0)
+        if weighted_score <= 0:
+            continue
 
-        # Optional TF-IDF similarity. It is a supporting signal, never the
-        # dominant signal, so generic ML papers do not rise to the top.
+        keyword_norm = min(weighted_score / 45.0, 1.0)
         similarity_norm = min(sims[idx] * 3.0, 1.0)
 
-        base_fit = 0.80 * keyword_norm + 0.20 * similarity_norm
+        base_fit = 0.85 * keyword_norm + 0.15 * similarity_norm
         recency = recency_factor(work.get("publication_date"))
-
-        # More recent matching papers count more.
         contribution = base_fit * (0.70 + 0.30 * recency)
 
         for authorship in work.get("authorships") or []:
@@ -715,7 +738,13 @@ def search_faculty_broad(raw_uni_name):
                     "professor": author_name,
                     "matched_works": {},
                     "fields": {},
+                    "senior_author_count": 0,
                 }
+
+            pos = authorship.get("author_position", "")
+            is_corr = authorship.get("is_corresponding", False)
+            if pos == "last" or is_corr:
+                author_stats[author_id]["senior_author_count"] += 1
 
             author_stats[author_id]["matched_works"][work.get("id")] = {
                 "title": work.get("title", "N/A"),
@@ -732,10 +761,8 @@ def search_faculty_broad(raw_uni_name):
                     author_stats[author_id]["fields"].get(field, 0) + contribution
                 )
 
-    # Preliminary ranking: strong research fit + breadth.
     for author_id, rec in author_stats.items():
         works = list(rec["matched_works"].values())
-
         if not works:
             rec["pre_score"] = 0.0
             continue
@@ -743,11 +770,13 @@ def search_faculty_broad(raw_uni_name):
         total_fit = sum(w["fit"] for w in works)
         best_fit = max(w["raw_fit"] for w in works)
         breadth = len(rec["fields"])
+        senior_bonus = min(rec["senior_author_count"] * 0.4, 1.5)
 
         rec["pre_score"] = (
-            min(total_fit / 5.0, 5.0)
+            min(total_fit / 4.0, 5.0)
             + min(best_fit * 4.0, 4.0)
             + min(breadth * 0.25, 1.0)
+            + senior_bonus
         )
 
     top_candidates = sorted(
@@ -756,12 +785,17 @@ def search_faculty_broad(raw_uni_name):
         reverse=True,
     )[:MAX_CANDIDATE_AUTHORS]
 
-    # Enrich the strongest candidate authors.
     faculty = []
     for rec in top_candidates:
-        author_data = get_author_details(rec["author_id"])
-        if not author_data:
-            author_data = {}
+        author_data = get_author_details(rec["author_id"]) or {}
+
+        # 1. Skip authors who are no longer at this university
+        if not author_currently_at_institution(author_data, inst_id):
+            continue
+
+        # 2. Skip junior students (keep actual PIs / senior researchers)
+        if not is_likely_faculty(author_data, rec["senior_author_count"]):
+            continue
 
         recent_author_works = get_recent_author_works(
             rec["author_id"],
@@ -776,7 +810,9 @@ def search_faculty_broad(raw_uni_name):
             author_data=author_data,
             recent_author_works=recent_author_works,
         )
-        faculty.append(enriched)
+
+        if enriched["research_fit_score"] >= MIN_RESEARCH_FIT_SCORE:
+            faculty.append(enriched)
 
         time.sleep(0.15)
 
@@ -929,7 +965,6 @@ def score_faculty_record(
     top_fit_values = [w["raw_fit"] for w in matched_works[:MAX_WORKS_FOR_FIT]]
 
     if top_fit_values:
-        # Best paper matters, but repeated high-quality matches matter too.
         best = max(top_fit_values)
         mean_top = sum(top_fit_values) / len(top_fit_values)
         research_score = min((0.60 * best + 0.40 * mean_top) * 10.0, 10.0)
@@ -937,15 +972,13 @@ def score_faculty_record(
         research_score = 0.0
 
     activity, latest_publication = activity_score(recent_author_works)
-
     homepage_url = author_data.get("homepage_url") or ""
-
     funding = detect_funding_from_homepage(homepage_url)
 
     faculty_score = (
-        0.60 * research_score
+        0.65 * research_score
         + 0.20 * activity
-        + 0.20 * funding["score"]
+        + 0.15 * funding["score"]
     )
 
     field_scores = candidate["fields"]
@@ -1004,7 +1037,6 @@ def send_telegram_html(text):
 
     try:
         response = requests.post(url, json=payload, timeout=20)
-
         if response.status_code != 200:
             print(f"[!] Telegram HTTP {response.status_code}: {response.text[:500]}")
             return False
@@ -1015,7 +1047,6 @@ def send_telegram_html(text):
             return False
 
         return True
-
     except Exception as exc:
         print(f"[!] Telegram send error: {exc}")
         return False
@@ -1049,7 +1080,6 @@ def send_telegram_document(file_path, caption=""):
             return False
 
         return True
-
     except Exception as exc:
         print(f"[!] Document send error: {exc}")
         return False
@@ -1059,8 +1089,17 @@ def send_telegram_document(file_path, caption=""):
 # SHEET OUTPUT
 # ==============================================================================
 
+NUMERIC_OUTPUT_COLUMNS = {
+    "University_Research_Fit",
+    "University_Activity",
+    "University_Funding_Evidence",
+    "University_Score",
+    "Faculty_Breadth",
+}
+
 OUTPUT_COLUMNS = [
     "Checked_General?",
+    "OpenAlex_Institution_ID",
     "Discovered_Field",
     "General_PI",
     "General_Paper",
@@ -1082,9 +1121,47 @@ def ensure_output_columns(df):
         if col not in df.columns:
             if col == "Checked_General?":
                 df[col] = "NO"
+            elif col in NUMERIC_OUTPUT_COLUMNS:
+                df[col] = 0.0
             else:
                 df[col] = ""
+        else:
+            # Avoid Pandas 2.x dtype incompatibilities when assigning strings to empty columns
+            if col in NUMERIC_OUTPUT_COLUMNS:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            else:
+                df[col] = df[col].fillna("").astype(str)
     return df
+
+
+def sync_duplicate_rows_from_checked(df):
+    """
+    If any row of a university is already marked YES, copy its output columns
+    to all other duplicate rows of that same university so it is never re-queued.
+    """
+    checked_mask = df["Checked_General?"].astype(str).str.strip().str.upper() == "YES"
+    checked_indices = df.index[checked_mask]
+
+    source_by_key = {}
+    for idx in checked_indices:
+        key = university_key(df.at[idx, "University"])
+        if key and key not in source_by_key:
+            source_by_key[key] = idx
+
+    synced_count = 0
+    for idx in df.index[~checked_mask]:
+        key = university_key(df.at[idx, "University"])
+        if key in source_by_key:
+            src_idx = source_by_key[key]
+            for col in OUTPUT_COLUMNS:
+                df.at[idx, col] = df.at[src_idx, col]
+            df.at[idx, "Checked_General?"] = "YES"
+            synced_count += 1
+
+    if synced_count > 0:
+        print(f"[✓] Synced {synced_count} unchecked duplicate row(s) of already-checked universities.")
+
+    return set(source_by_key.keys())
 
 
 def format_faculty_details(faculty):
@@ -1119,20 +1196,24 @@ def format_funding_details(faculty):
 
 def update_dataframe_row(df, idx, result):
     faculty = result["faculty"]
+    institution = result.get("institution") or {}
+    inst_id = (institution.get("id") or "").rstrip("/").split("/")[-1]
+    df.at[idx, "OpenAlex_Institution_ID"] = inst_id
 
     if not faculty:
         df.at[idx, "Discovered_Field"] = ""
         df.at[idx, "General_PI"] = ""
         df.at[idx, "General_Paper"] = ""
-        df.at[idx, "University_Research_Fit"] = 0
-        df.at[idx, "University_Activity"] = 0
-        df.at[idx, "University_Funding_Evidence"] = 0
-        df.at[idx, "University_Score"] = 0
+        df.at[idx, "University_Research_Fit"] = 0.0
+        df.at[idx, "University_Activity"] = 0.0
+        df.at[idx, "University_Funding_Evidence"] = 0.0
+        df.at[idx, "University_Score"] = 0.0
         df.at[idx, "Faculty_Breadth"] = 0
         df.at[idx, "Top_Faculty"] = ""
         df.at[idx, "Top_Faculty_Details"] = ""
         df.at[idx, "Funding_Evidence_Details"] = ""
         df.at[idx, "Last_Publication"] = ""
+        df.at[idx, "Note"] = ""
         return
 
     top_n = faculty[:MAX_FACULTY_PER_UNIVERSITY]
@@ -1142,12 +1223,12 @@ def update_dataframe_row(df, idx, result):
     funding_score_avg = sum(x["funding_score"] for x in top_n) / len(top_n)
 
     university_score = (
-        0.60 * research_score
+        0.65 * research_score
         + 0.20 * activity_score_avg
-        + 0.20 * funding_score_avg
+        + 0.15 * funding_score_avg
     )
 
-    breadth = sum(1 for x in top_n if x["research_fit_score"] >= 6.5)
+    breadth = sum(1 for x in top_n if x["research_fit_score"] >= 6.0)
 
     last_pub = max(
         [x["latest_publication"] for x in top_n if x["latest_publication"]],
@@ -1171,21 +1252,22 @@ def update_dataframe_row(df, idx, result):
 
 
 def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
-    """Apply practical formatting so each faculty is readable row-by-row."""
+    """Apply practical formatting and ensure main_sheet_name stays first."""
     try:
         wb = load_workbook(file_name)
+        if main_sheet_name in wb.sheetnames and wb.sheetnames[0] != main_sheet_name:
+            wb.move_sheet(main_sheet_name, offset=-wb.sheetnames.index(main_sheet_name))
+
         for ws in wb.worksheets:
             ws.freeze_panes = "A2"
             ws.auto_filter.ref = ws.dimensions
-            ws.sheet_view.showGridLines = False
+            ws.sheet_view.showGridLines = True
 
-            # Sensible widths; cap very long text columns.
             for col_cells in ws.columns:
                 values = [str(c.value or "") for c in col_cells[:50]]
                 width = min(max(max((len(v) for v in values), default=10) + 2, 12), 42)
                 ws.column_dimensions[col_cells[0].column_letter].width = width
 
-            # Extra room for detailed narrative cells.
             for col in ws.iter_cols(1, ws.max_column):
                 header = str(col[0].value or "")
                 if "Details" in header or "Evidence" in header:
@@ -1251,20 +1333,41 @@ def build_faculty_rows(processed_results):
     return pd.DataFrame(rows)
 
 
-def save_outputs(df, processed_results):
-    """Save the university tracker plus a row-by-row Faculty Results sheet."""
-    faculty_df = build_faculty_rows(processed_results)
+def save_outputs(df, processed_results, main_sheet_name="Sheet1"):
+    """Save the university tracker and append to the Faculty Results sheet without erasing history."""
+    new_faculty_df = build_faculty_rows(processed_results)
 
     if FILE_NAME.endswith(".csv"):
         df.to_csv(FILE_NAME, index=False)
         faculty_file = "Faculty Results.csv"
-        faculty_df.to_csv(faculty_file, index=False)
+        if os.path.exists(faculty_file) and not new_faculty_df.empty:
+            try:
+                old_f_df = pd.read_csv(faculty_file)
+                new_keys = {university_key(u) for u in new_faculty_df["University"]}
+                old_f_df = old_f_df[~old_f_df["University"].map(university_key).isin(new_keys)]
+                combined_faculty_df = pd.concat([old_f_df, new_faculty_df], ignore_index=True)
+            except Exception:
+                combined_faculty_df = new_faculty_df
+        else:
+            combined_faculty_df = new_faculty_df
+
+        combined_faculty_df.to_csv(faculty_file, index=False)
         return faculty_file
 
-    # Preserve the existing workbook and all unrelated sheets.
-    wb = load_workbook(FILE_NAME)
-    main_sheet_name = wb.sheetnames[0] if wb.sheetnames else "Sheet1"
-    wb.close()
+    # Read existing Faculty Results sheet if it exists so we append instead of wiping
+    combined_faculty_df = new_faculty_df
+    try:
+        wb = load_workbook(FILE_NAME, read_only=True)
+        has_faculty_sheet = "Faculty Results" in wb.sheetnames
+        wb.close()
+        if has_faculty_sheet and not new_faculty_df.empty:
+            old_f_df = pd.read_excel(FILE_NAME, sheet_name="Faculty Results")
+            if "University" in old_f_df.columns:
+                new_keys = {university_key(u) for u in new_faculty_df["University"]}
+                old_f_df = old_f_df[~old_f_df["University"].map(university_key).isin(new_keys)]
+                combined_faculty_df = pd.concat([old_f_df, new_faculty_df], ignore_index=True)
+    except Exception as exc:
+        print(f"[!] Note while merging existing Faculty Results: {exc}")
 
     with pd.ExcelWriter(
         FILE_NAME,
@@ -1273,7 +1376,7 @@ def save_outputs(df, processed_results):
         if_sheet_exists="replace",
     ) as writer:
         df.to_excel(writer, sheet_name=main_sheet_name, index=False)
-        faculty_df.to_excel(writer, sheet_name="Faculty Results", index=False)
+        combined_faculty_df.to_excel(writer, sheet_name="Faculty Results", index=False)
 
     style_excel_workbook(FILE_NAME, main_sheet_name)
     return FILE_NAME
@@ -1284,9 +1387,8 @@ def save_outputs(df, processed_results):
 # ==============================================================================
 
 def build_university_report(universities, all_matches):
-    """Build multiple short Telegram messages; never silently truncate the report."""
     chunks = []
-    current = ["🎯 <b>Faculty Finder v3 — Faculty Matches</b>", ""]
+    current = ["🎯 <b>Faculty Finder v3.1 — Faculty Matches</b>", ""]
 
     def flush():
         nonlocal current
@@ -1302,17 +1404,17 @@ def build_university_report(universities, all_matches):
 
         lines = [f"🏛 <b>{html.escape(uni_name)}</b>"]
         if not faculty:
-            lines.append("   No strong faculty match found.")
+            lines.append("   No strong faculty match found (above threshold).")
             lines.append("─" * 28)
         else:
             top_n = faculty[:MAX_FACULTY_PER_UNIVERSITY]
             research = sum(x["research_fit_score"] for x in top_n) / len(top_n)
             activity = sum(x["activity_score"] for x in top_n) / len(top_n)
             funding = sum(x["funding_score"] for x in top_n) / len(top_n)
-            university_score = 0.60 * research + 0.20 * activity + 0.20 * funding
+            university_score = 0.65 * research + 0.20 * activity + 0.15 * funding
 
             lines.extend([
-                f"   ⭐ University score: <b>{university_score:.1f}/10</b>",
+                f"   ⭐ University score: <b>{university_score:.1f}/10</b> ({len(top_n)} matched PIs)",
                 f"   🎯 Research: {research:.1f} | 📚 Activity: {activity:.1f} | 💰 Funding evidence: {funding:.1f}",
                 "",
             ])
@@ -1337,10 +1439,9 @@ def build_university_report(universities, all_matches):
             lines.append("─" * 28)
 
         block = "\n".join(lines)
-        # Keep a conservative margin below Telegram's 4096-char limit.
         if len("\n".join(current + [block])) > 3500:
             flush()
-            current = ["🎯 <b>Faculty Finder v3 — continued</b>", "", block]
+            current = ["🎯 <b>Faculty Finder v3.1 — continued</b>", "", block]
         else:
             current.append(block)
 
@@ -1359,7 +1460,7 @@ def send_report_chunks(chunks):
 # ==============================================================================
 
 def main():
-    print("🚀 Running Faculty Finder v3...")
+    print("🚀 Running Faculty Finder v3.1...")
     print(f"Loading file: {FILE_NAME}")
 
     if not os.path.exists(FILE_NAME):
@@ -1369,12 +1470,14 @@ def main():
     try:
         if FILE_NAME.endswith(".csv"):
             df = pd.read_csv(FILE_NAME)
-            original_sheet_name = None
+            original_sheet_name = "Sheet1"
         else:
-            df = pd.read_excel(FILE_NAME)
             wb = load_workbook(FILE_NAME, read_only=True)
-            original_sheet_name = wb.sheetnames[0] if wb.sheetnames else "Sheet1"
+            # Pick the main tracking sheet (never accidentally load "Faculty Results")
+            non_result_sheets = [s for s in wb.sheetnames if s != "Faculty Results"]
+            original_sheet_name = non_result_sheets[0] if non_result_sheets else wb.sheetnames[0]
             wb.close()
+            df = pd.read_excel(FILE_NAME, sheet_name=original_sheet_name)
     except Exception as exc:
         print(f"[!] Failed to read tracking file: {exc}")
         return
@@ -1385,7 +1488,17 @@ def main():
 
     df = ensure_output_columns(df)
 
-    # Only process unchecked rows, but collapse duplicates to UNIQUE universities.
+    # 1. Sync any duplicate rows of universities that already have at least one 'YES' row
+    already_checked_keys = sync_duplicate_rows_from_checked(df)
+
+    # Also track already-checked OpenAlex Institution IDs to avoid aliases repeating
+    checked_inst_ids = {}
+    for idx in df.index[df["Checked_General?"].astype(str).str.upper() == "YES"]:
+        inst_id = str(df.at[idx, "OpenAlex_Institution_ID"]).strip()
+        if inst_id and inst_id.lower() != "nan":
+            checked_inst_ids[inst_id] = idx
+
+    # 2. Filter remaining unchecked rows
     mask = (
         df["University"].notna()
         & (df["University"].astype(str).str.strip() != "")
@@ -1393,79 +1506,101 @@ def main():
         & (df["Checked_General?"].astype(str).str.upper() != "YES")
     )
 
-    seen_keys = set()
-    unique_batch = []
+    seen_keys = set(already_checked_keys)
+    unique_candidates = []
     for idx in df.index[mask]:
         raw_name = str(df.at[idx, "University"]).strip()
         key = university_key(raw_name)
         if not key or key in seen_keys:
             continue
         seen_keys.add(key)
-        unique_batch.append((key, raw_name))
-        if len(unique_batch) >= BATCH_SIZE:
-            break
+        unique_candidates.append((key, raw_name))
 
-    if not unique_batch:
+    if not unique_candidates:
+        save_outputs(df, [], original_sheet_name)
         print("[✓] All unique universities have been checked.")
-        send_telegram_html("🎉 <b>Faculty Finder v3:</b> all unique universities have been processed.")
+        send_telegram_html("🎉 <b>Faculty Finder v3.1:</b> all unique universities have been processed.")
         return
 
-    print(f"\nProcessing {len(unique_batch)} UNIQUE universities (duplicates collapsed):")
-    for number, (_, uni) in enumerate(unique_batch, start=1):
-        duplicate_count = len(duplicate_indices_for_university(df, university_key(uni)))
-        suffix = f" ({duplicate_count} rows in sheet)" if duplicate_count > 1 else ""
-        print(f"  {number}. {uni}{suffix}")
-
     all_matches = []
+    reported_universities = []
     successful_count = 0
     failed_count = 0
 
-    for batch_pos, (uni_key, raw_uni) in enumerate(unique_batch, start=1):
+    for uni_key, raw_uni in unique_candidates:
+        if len(reported_universities) >= BATCH_SIZE:
+            break
+
         print("\n" + "=" * 88)
-        print(f"🏛 [{batch_pos}/{len(unique_batch)}] {raw_uni}")
+        print(f"🏛 [{len(reported_universities) + 1}/{BATCH_SIZE}] {raw_uni}")
         print("=" * 88)
 
-        result = search_faculty_broad(raw_uni)
+        institution = resolve_institution(raw_uni)
+        if not institution:
+            print(f"[!] Could not resolve {raw_uni}; marking as checked (unresolved) to prevent infinite retry loop.")
+            matching_indices = duplicate_indices_for_university(df, uni_key)
+            for idx in matching_indices:
+                df.at[idx, "Checked_General?"] = "YES"
+                df.at[idx, "Note"] = "Institution not resolved in OpenAlex"
+            failed_count += 1
+            continue
+
+        inst_id = institution["id"].rstrip("/").split("/")[-1]
+
+        # Check if this exact OpenAlex institution was already processed under another name!
+        if inst_id in checked_inst_ids:
+            src_idx = checked_inst_ids[inst_id]
+            print(f"[!] {raw_uni} resolves to {institution.get('display_name')} ({inst_id}), which was ALREADY checked! Syncing row(s) and skipping.")
+            matching_indices = duplicate_indices_for_university(df, uni_key)
+            for idx in matching_indices:
+                for col in OUTPUT_COLUMNS:
+                    df.at[idx, col] = df.at[src_idx, col]
+                df.at[idx, "Checked_General?"] = "YES"
+            continue
+
+        result = search_faculty_broad(raw_uni, institution=institution)
 
         if not result["ok"]:
-            print(f"[!] Search failed for {raw_uni}; leaving its rows unchecked.")
             failed_count += 1
             continue
 
         successful_count += 1
+        reported_universities.append(raw_uni)
         all_matches.append({
             "university": raw_uni,
             "institution": result.get("institution") or {},
             "faculty": result.get("faculty", []),
         })
 
-        # IMPORTANT: update ALL duplicate rows for this university in one pass.
         matching_indices = duplicate_indices_for_university(df, uni_key)
         for idx in matching_indices:
             update_dataframe_row(df, idx, result)
             df.at[idx, "Checked_General?"] = "YES"
 
+        if matching_indices:
+            checked_inst_ids[inst_id] = matching_indices[0]
+
         print(f"[✓] Updated {len(matching_indices)} spreadsheet row(s) for {raw_uni}.")
 
         if result["faculty"]:
-            print(f"[✓] Top {min(len(result['faculty']), MAX_FACULTY_PER_UNIVERSITY)} faculty:")
-            for rank, faculty in enumerate(result["faculty"], start=1):
+            print(f"[✓] Top {len(result['faculty'])} faculty:")
+            for rank, fac in enumerate(result["faculty"], start=1):
                 print(
-                    f"   {rank}. {faculty['professor']} | "
-                    f"Fit={faculty['research_fit_score']:.1f} | "
-                    f"Activity={faculty['activity_score']:.1f} | "
-                    f"Funding={faculty['funding_score']:.1f} | "
-                    f"Overall={faculty['faculty_score']:.1f} | "
-                    f"{faculty['field']}"
+                    f"   {rank}. {fac['professor']} | "
+                    f"Fit={fac['research_fit_score']:.1f} | "
+                    f"Activity={fac['activity_score']:.1f} | "
+                    f"Funding={fac['funding_score']:.1f} | "
+                    f"Overall={fac['faculty_score']:.1f} | "
+                    f"{fac['field']}"
                 )
         else:
-            print("[–] No strong faculty match found.")
+            print("[–] No strong faculty match found above threshold.")
 
         time.sleep(0.5)
 
-    # Save progress even if some universities failed.
+    # Save progress
     try:
-        faculty_file = save_outputs(df, all_matches)
+        faculty_file = save_outputs(df, all_matches, original_sheet_name)
         print(f"\n[✓] Tracking output updated: {FILE_NAME}")
         if faculty_file != FILE_NAME:
             print(f"[✓] Row-by-row faculty output: {faculty_file}")
@@ -1473,27 +1608,29 @@ def main():
         print(f"[!] Failed to save output files: {exc}")
         return
 
-    # Telegram: multiple messages so no university/faculty block is silently cut.
-    universities = [uni for _, uni in unique_batch]
-    report_chunks = build_university_report(universities, all_matches)
-    send_report_chunks(report_chunks)
+    if reported_universities:
+        report_chunks = build_university_report(reported_universities, all_matches)
+        send_report_chunks(report_chunks)
 
-    send_telegram_document(
-        FILE_NAME,
-        caption=(
-            f"💾 Faculty Finder v3 updated sheet | "
-            f"Processed: {successful_count}/{len(unique_batch)} unique universities | "
-            f"Failed: {failed_count}"
-        ),
-    )
-
-    if FILE_NAME.endswith(".csv") and os.path.exists("Faculty Results.csv"):
         send_telegram_document(
-            "Faculty Results.csv",
-            caption="📋 Row-by-row faculty results (one professor per row).",
+            FILE_NAME,
+            caption=(
+                f"💾 Faculty Finder v3.1 updated sheet | "
+                f"Processed: {successful_count} new unique universities | "
+                f"Unresolved/Skipped: {failed_count}"
+            ),
         )
 
+        if FILE_NAME.endswith(".csv") and os.path.exists("Faculty Results.csv"):
+            send_telegram_document(
+                "Faculty Results.csv",
+                caption="📋 Row-by-row faculty results (one professor per row).",
+            )
+    else:
+        send_telegram_html("🎉 <b>Faculty Finder v3.1:</b> All remaining rows were duplicates of already-checked universities and have been synced.")
+
     print("\n✅ Run complete.")
+
 
 if __name__ == "__main__":
     main()
