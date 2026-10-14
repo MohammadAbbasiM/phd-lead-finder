@@ -3,6 +3,7 @@ import re
 import time
 import html
 import unicodedata
+from urllib.parse import urlparse
 import requests
 import pandas as pd
 from openpyxl import load_workbook
@@ -27,7 +28,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY")  # Optional.
 
-# Detect whichever tracking file is present in the repository.
 if os.path.exists("List of emails.xlsx"):
     FILE_NAME = "List of emails.xlsx"
 elif os.path.exists("List of emails.xlsx - Sheet1.csv"):
@@ -35,9 +35,9 @@ elif os.path.exists("List of emails.xlsx - Sheet1.csv"):
 else:
     FILE_NAME = "List of emails.xlsx"
 
-BATCH_SIZE = 5
-MAX_FACULTY_PER_UNIVERSITY = 5
-MIN_RESEARCH_FIT_SCORE = 2.5  # حداقل امتیاز تناسب پژوهشی برای گزارش شدن استاد
+BATCH_SIZE = 5                        # بررسی ۵ دانشگاه جدید در هر نوبت اجرا
+MAX_FACULTY_PER_UNIVERSITY = None     # None = بدون محدودیت (یافتن تمام اساتید مرتبط در هر دانشگاه)
+MIN_RESEARCH_FIT_SCORE = 2.5          # حداقل امتیاز تناسب پژوهشی برای گزارش شدن استاد
 
 # Minimum author profile thresholds to filter out undergraduate/PhD students
 MIN_AUTHOR_WORKS_COUNT = 12
@@ -46,9 +46,9 @@ MIN_AUTHOR_H_INDEX = 4
 # Recent publication window.
 RECENT_YEARS = 5
 
-# Search breadth.
-WORKS_PER_GROUP = 15
-MAX_CANDIDATE_AUTHORS = 25
+# Search breadth (افزایش دامنه جستجو برای پوشش کامل اساتید هر دانشگاه)
+WORKS_PER_GROUP = 50
+MAX_CANDIDATE_AUTHORS = 60
 MAX_WORKS_FOR_FIT = 10
 
 # Optional homepage crawl for funding evidence.
@@ -59,12 +59,196 @@ MAX_HOMEPAGE_CHARS = 50000
 OPENALEX_BASE = "https://api.openalex.org"
 OPENALEX_EMAIL = "phd-lead-finder@academic.org"
 
-# ==============================================================================
-# CANDIDATE RESEARCH PROFILE
-# ==============================================================================
 
 # ==============================================================================
-# CANDIDATE RESEARCH PROFILE (OPTIMIZED FOR ROBOTICS, SLAM, 3D VISION & EDGE AI)
+# COUNTRY, ADMISSION SYSTEM & RANKING METADATA
+# ==============================================================================
+
+COUNTRY_NAMES = {
+    "US": "United States", "GB": "United Kingdom", "DE": "Germany", "CH": "Switzerland",
+    "NL": "Netherlands", "SE": "Sweden", "CA": "Canada", "AU": "Australia",
+    "FR": "France", "IT": "Italy", "ES": "Spain", "DK": "Denmark",
+    "NO": "Norway", "FI": "Finland", "AT": "Austria", "BE": "Belgium",
+    "SG": "Singapore", "HK": "Hong Kong", "CN": "China", "JP": "Japan",
+    "KR": "South Korea", "IE": "Ireland", "PT": "Portugal", "PL": "Poland",
+    "CZ": "Czechia", "NZ": "New Zealand", "IL": "Israel", "LU": "Luxembourg",
+}
+
+ADMISSION_SYSTEM_BY_COUNTRY = {
+    "NL": "Vacancy-based (Job Portal + Contact PI)",
+    "SE": "Vacancy-based (Official Job Portal)",
+    "NO": "Vacancy-based (Job Portal, Paid Employee)",
+    "DK": "Vacancy-based (Job Portal + PI)",
+    "FI": "Doctoral Network / Portal + PI",
+    "CH": "Direct to PI + Formal Portal (Employee Contract)",
+    "DE": "Direct to PI / Chair (Cold Email Strong)",
+    "AT": "Direct to PI + Vacancy Portal",
+    "BE": "Vacancy Portal + Direct to PI",
+    "FR": "Project-based (Direct to PI / CNRS / Inria)",
+    "IT": "National Call (Bando) + Contact PI",
+    "ES": "Project Grant / FPI + Contact PI",
+    "GB": "Studentship / CDT + Contact PI (Check Intl Funding)",
+    "IE": "SFI / Project Funded + Contact PI",
+    "US": "Central Committee + Direct PI (RA/TA)",
+    "CA": "Direct to PI Agreement Required + Portal",
+    "AU": "Direct to PI + RTP Scholarship Deadline",
+    "SG": "Central Scholarship (SINGA/NGS) + Contact PI",
+    "HK": "HKPFS / University Fellowship + Contact PI",
+}
+
+# رتبه‌بندی مرجع برای دانشگاه‌های شاخص مهندسی و رباتیک (در کنار رتبه محاسباتی OpenAlex)
+KNOWN_QS_RANKS = {
+    "massachusetts institute of technology": "QS #1",
+    "imperial college london": "QS #2",
+    "university of oxford": "QS #3",
+    "harvard university": "QS #4",
+    "university of cambridge": "QS #5",
+    "stanford university": "QS #6",
+    "eth zurich": "QS #7",
+    "national university of singapore": "QS #8",
+    "university college london": "QS #9",
+    "california institute of technology": "QS #10",
+    "university of california berkeley": "QS #12",
+    "nanyang technological university singapore": "QS #15",
+    "university of hong kong": "QS #17",
+    "university of sydney": "QS #18",
+    "university of new south wales": "QS #19",
+    "tsinghua university": "QS #20",
+    "university of toronto": "QS #25",
+    "ecole polytechnique federale de lausanne": "QS #26",
+    "university of edinburgh": "QS #27",
+    "technical university of munich": "QS #28",
+    "mcgill university": "QS #29",
+    "australian national university": "QS #30",
+    "seoul national university": "QS #31",
+    "johns hopkins university": "QS #32",
+    "university of tokyo": "QS #32",
+    "columbia university": "QS #34",
+    "university of manchester": "QS #34",
+    "chinese university of hong kong": "QS #36",
+    "monash university": "QS #37",
+    "university of british columbia": "QS #38",
+    "university of michigan ann arbor": "QS #44",
+    "delft university of technology": "QS #47 (Top 15 Eng)",
+    "hong kong university of science and technology": "QS #47",
+    "carnegie mellon university": "QS #58 (#1 CS/Robotics)",
+    "university of amsterdam": "QS #55",
+    "kaist": "QS #53",
+    "ku leuven": "QS #63",
+    "sorbonne university": "QS #63",
+    "university of texas at austin": "QS #66",
+    "kth royal institute of technology": "QS #74 (Top 30 Eng)",
+    "university of glasgow": "QS #78",
+    "university of southampton": "QS #80",
+    "university of birmingham": "QS #80",
+    "lund university": "QS #75",
+    "university of illinois urbana champaign": "QS #69 (Top 10 CS)",
+    "georgia institute of technology": "QS #114 (Top 10 Eng)",
+    "purdue university": "QS #89 (Top 15 Eng)",
+    "rwth aachen university": "QS #99 (Top 25 Eng)",
+    "university of zurich": "QS #109",
+    "uppsala university": "QS #103",
+    "aalto university": "QS #113",
+    "university of waterloo": "QS #115 (Top 25 CS)",
+    "politecnico di milano": "QS #111 (Top 20 Eng)",
+    "technical university of denmark": "QS #109 (Top 35 Eng)",
+    "chalmers university of technology": "QS #139 (Strong Eng)",
+    "eindhoven university of technology": "QS #136 (Strong Robotics)",
+    "kit karlsruhe institute of technology": "QS #102 (Strong Robotics)",
+    "karlsruhe institute of technology": "QS #102 (Strong Robotics)",
+    "tu berlin": "QS #147",
+    "university of twente": "QS #233 (Strong Robotics)",
+    "university of bonn": "QS #227 (Top Geodesy/Robotics)",
+    "university of freiburg": "QS #212 (Top Robotics/AIS)",
+    "politecnico di torino": "QS #241 (Top 50 Eng)",
+    "university of bologna": "QS #133",
+    "sapienza university of rome": "QS #132",
+    "university of padua": "QS #236",
+    "radboud university": "QS #242",
+    "ghent university": "QS #162",
+    "vienna university of technology": "QS #190",
+    "tu wien": "QS #190",
+    "graz university of technology": "QS #413 (Strong Vision/Robotics)",
+    "ntnu": "QS #264 (Strong Marine/Autonomy)",
+    "norwegian university of science and technology": "QS #264 (Strong Autonomy)",
+}
+
+
+def extract_institution_metadata(institution):
+    """
+    Extract Country, City, Ranking/Tier, Email Domain, and PhD Admission System
+    directly from the OpenAlex Institution object.
+    """
+    if not institution:
+        return {
+            "country": "",
+            "city": "",
+            "ranking": "",
+            "domain": "",
+            "phd_system": "",
+            "inst_h_index": 0,
+        }
+
+    geo = institution.get("geo") or {}
+    country_code = (institution.get("country_code") or geo.get("country_code") or "").upper()
+    country_name = geo.get("country") or COUNTRY_NAMES.get(country_code, country_code)
+    city_name = geo.get("city") or ""
+
+    # Email domain from homepage_url
+    homepage = institution.get("homepage_url") or ""
+    domain = ""
+    if homepage:
+        try:
+            netloc = urlparse(homepage).netloc.lower()
+            netloc = re.sub(r"^www\.", "", netloc)
+            if netloc:
+                domain = f"@{netloc}"
+        except Exception:
+            pass
+
+    # Ranking + OpenAlex Impact Tier
+    summary = institution.get("summary_stats") or {}
+    h_index = summary.get("h_index", 0) or 0
+    display_name = institution.get("display_name", "")
+    norm_key = university_key(display_name)
+
+    qs_label = KNOWN_QS_RANKS.get(norm_key, "")
+    if not qs_label:
+        for k, v in KNOWN_QS_RANKS.items():
+            if k in norm_key or norm_key in k:
+                qs_label = v
+                break
+
+    if h_index >= 550:
+        tier_label = f"Tier S+ (Global Elite | h={h_index})"
+    elif h_index >= 380:
+        tier_label = f"Tier S (Top 100 Research | h={h_index})"
+    elif h_index >= 250:
+        tier_label = f"Tier A+ (Major Research Uni | h={h_index})"
+    elif h_index >= 150:
+        tier_label = f"Tier A (Strong Research Uni | h={h_index})"
+    elif h_index >= 80:
+        tier_label = f"Tier B+ (Active Research Uni | h={h_index})"
+    elif h_index > 0:
+        tier_label = f"Tier B (Specialized/Regional | h={h_index})"
+    else:
+        tier_label = "Research Institution"
+
+    ranking_str = f"{qs_label} | {tier_label}" if qs_label else tier_label
+    phd_system = ADMISSION_SYSTEM_BY_COUNTRY.get(country_code, "Direct to PI + University Portal")
+
+    return {
+        "country": country_name,
+        "city": city_name,
+        "ranking": ranking_str,
+        "domain": domain,
+        "phd_system": phd_system,
+        "inst_h_index": h_index,
+    }
+
+
+# ==============================================================================
+# CANDIDATE RESEARCH PROFILE (ROBOTICS, SLAM, 3D VISION & EDGE AI)
 # ==============================================================================
 
 SEARCH_GROUPS = [
@@ -164,7 +348,6 @@ SEARCH_GROUPS = [
     ),
 ]
 
-# Tier 1: Core direct-fit research topics (Highest priority: 7.5 - 10.0)
 TIER1_PHRASES = {
     "visual inertial odometry": 10.0,
     "visual inertial navigation": 10.0,
@@ -194,7 +377,6 @@ TIER1_PHRASES = {
     "sensor fusion": 7.5,
 }
 
-# Tier 2: Strong complementary methodologies & hardware/vision alignment (4.5 - 6.5)
 TIER2_PHRASES = {
     "pose estimation": 6.5,
     "trajectory estimation": 6.5,
@@ -222,7 +404,6 @@ TIER2_PHRASES = {
     "real-time computer vision": 4.5,
 }
 
-# Tier 3: Supporting tools, platforms & general domain terms (1.0 - 2.5)
 TIER3_PHRASES = {
     "autonomous vehicles": 2.5,
     "probabilistic robotics": 2.5,
@@ -272,6 +453,7 @@ FUNDING_MEDIUM = [
     "join us",
 ]
 
+
 # ==============================================================================
 # HTTP HELPERS
 # ==============================================================================
@@ -279,14 +461,13 @@ FUNDING_MEDIUM = [
 session = requests.Session()
 session.headers.update(
     {
-        "User-Agent": f"Mozilla/5.0 PhDLeadFinder/3.1 (+mailto:{OPENALEX_EMAIL})",
+        "User-Agent": f"Mozilla/5.0 PhDLeadFinder/3.3 (+mailto:{OPENALEX_EMAIL})",
         "Accept-Language": "en-US,en;q=0.9",
     }
 )
 
 
 def openalex_get(path_or_url, params=None, timeout=20, retries=3):
-    """GET an OpenAlex endpoint with retries and useful diagnostics."""
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
         url = path_or_url
     else:
@@ -334,12 +515,10 @@ def normalize_name(value):
 
 
 def clean_university_name(name):
-    """Clean Excel annotations, notes, and parenthetical text."""
     name = str(name or "").strip()
     name = re.sub(r"\s+", " ", name)
     name = re.sub(r"\([^)]*\)", "", name).strip()
 
-    # Remove common spreadsheet notes after separators (- or – or —).
     name = re.sub(r"\s*[-–—]\s*\d+\s*years?\s+phd.*$", "", name, flags=re.I)
     name = re.sub(r"\s*[-–—]\s*(phd|master|msc|department|faculty|school).*$", "", name, flags=re.I)
 
@@ -378,7 +557,6 @@ UNIVERSITY_ALIASES = {
 
 
 def university_key(name):
-    """Return a canonical key so duplicates are collapsed across the entire sheet."""
     cleaned = clean_university_name(name)
     normalized = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
     normalized = normalize_name(normalized)
@@ -388,12 +566,10 @@ def university_key(name):
 
 
 def duplicate_indices_for_university(df, key):
-    """Return every row index representing the same university key."""
     return [idx for idx in df.index if university_key(df.at[idx, "University"]) == key]
 
 
 def contains_whole_phrase(text, phrase):
-    """Match whole words/phrases only, avoiding false substrings like 'ros' in 'across'."""
     pattern = r"\b" + re.escape(phrase) + r"\b"
     return bool(re.search(pattern, text))
 
@@ -431,10 +607,6 @@ def work_text(work):
 
 
 def phrase_score(text):
-    """
-    Weighted phrase matching using word boundaries (\b).
-    Requires at least one Tier-1 or Tier-2 match to count Tier-3 generic terms.
-    """
     lower = normalize_name(text)
     total = 0.0
     matched = []
@@ -448,7 +620,6 @@ def phrase_score(text):
                 matched.append((phrase, weight, tier))
                 has_core_match = True
 
-    # Only add generic Tier-3 terms if the paper has some core relevance or multiple Tier-3 hits
     t3_hits = []
     for phrase, weight in TIER3_PHRASES.items():
         normalized_phrase = normalize_name(phrase)
@@ -460,7 +631,6 @@ def phrase_score(text):
             total += item[1]
             matched.append(item)
 
-    # Bonus for explicitly strong word-bounded combinations.
     combo_pairs = [
         ("gnss", "sensor fusion"),
         ("camera", "imu"),
@@ -606,10 +776,6 @@ def author_belongs_to_institution(authorship, institution_id):
 
 
 def author_currently_at_institution(author_data, target_inst_id):
-    """
-    Verify if the author is STILL affiliated with the target university.
-    Filters out graduated PhD students or visiting researchers who left.
-    """
     if not author_data:
         return True
 
@@ -623,7 +789,6 @@ def author_currently_at_institution(author_data, target_inst_id):
                 return True
         return False
 
-    # Fallback to affiliations history if last_known_institutions is empty
     affiliations = author_data.get("affiliations") or []
     current_year = datetime.now(timezone.utc).year
     for aff in affiliations:
@@ -637,10 +802,6 @@ def author_currently_at_institution(author_data, target_inst_id):
 
 
 def is_likely_faculty(author_data, senior_paper_count):
-    """
-    Filter out junior students by checking publication volume, h-index,
-    and whether they appear as last/corresponding author.
-    """
     if not author_data:
         return senior_paper_count >= 1
 
@@ -653,6 +814,14 @@ def is_likely_faculty(author_data, senior_paper_count):
     if senior_paper_count >= 2 and works_count >= 8:
         return True
     return False
+
+
+def estimate_seniority(h_index, works_count):
+    if h_index >= 30 or works_count >= 150:
+        return "Full / Senior Prof (Large Lab)"
+    if h_index >= 14 or works_count >= 50:
+        return "Associate / Established PI (High Fit)"
+    return "Assistant Prof / Rising Star (Responsive)"
 
 
 def search_faculty_broad(raw_uni_name, institution=None):
@@ -795,11 +964,9 @@ def search_faculty_broad(raw_uni_name, institution=None):
     for rec in top_candidates:
         author_data = get_author_details(rec["author_id"]) or {}
 
-        # 1. Skip authors who are no longer at this university
         if not author_currently_at_institution(author_data, inst_id):
             continue
 
-        # 2. Skip junior students (keep actual PIs / senior researchers)
         if not is_likely_faculty(author_data, rec["senior_author_count"]):
             continue
 
@@ -997,6 +1164,29 @@ def score_faculty_record(
         )[:3]
     ]
 
+    # Collect unique matched phrases across top works for Cold Email writing
+    hook_phrases = []
+    for w in matched_works[:5]:
+        for p in w.get("matched_phrases", []):
+            if p not in hook_phrases:
+                hook_phrases.append(p)
+
+    # Extract Professor H-index, Citations, and Seniority
+    summary_stats = author_data.get("summary_stats") or {}
+    prof_h_index = summary_stats.get("h_index", 0) or 0
+    total_works = author_data.get("works_count", 0) or 0
+    total_citations = author_data.get("cited_by_count", 0) or 0
+    seniority = estimate_seniority(prof_h_index, total_works)
+
+    meta = extract_institution_metadata(institution)
+    domain_clean = meta["domain"].lstrip("@")
+    prof_name = candidate["professor"]
+    if domain_clean:
+        search_q = f'site:{domain_clean} "{prof_name}" email'
+    else:
+        search_q = f'"{prof_name}" "{raw_uni_name}" email'
+    email_finder_url = f"https://www.google.com/search?q={ requests.utils.quote(search_q) }"
+
     top_work = matched_works[0] if matched_works else {}
     recent_title = top_work.get("title", "N/A")
     recent_year = top_work.get("year", "")
@@ -1004,8 +1194,18 @@ def score_faculty_record(
     return {
         "field": top_fields[0] if top_fields else "General CV/Robotics",
         "fields": top_fields,
-        "professor": candidate["professor"],
+        "professor": prof_name,
         "university": raw_uni_name,
+        "country": meta["country"],
+        "city": meta["city"],
+        "ranking": meta["ranking"],
+        "email_domain": meta["domain"],
+        "phd_system": meta["phd_system"],
+        "prof_h_index": prof_h_index,
+        "total_citations": total_citations,
+        "seniority": seniority,
+        "cold_email_keywords": ", ".join(hook_phrases[:6]),
+        "email_finder_url": email_finder_url,
         "author_id": candidate["author_id"],
         "profile_url": author_data.get("id", candidate["author_id"]),
         "homepage_url": homepage_url,
@@ -1092,7 +1292,7 @@ def send_telegram_document(file_path, caption=""):
 
 
 # ==============================================================================
-# SHEET OUTPUT
+# SHEET OUTPUT & COLUMN MAPPING
 # ==============================================================================
 
 NUMERIC_OUTPUT_COLUMNS = {
@@ -1104,10 +1304,17 @@ NUMERIC_OUTPUT_COLUMNS = {
 }
 
 OUTPUT_COLUMNS = [
+    "Country",
+    "City",
+    "Ranking",
+    "Email_Domain",
+    "PhD_Admission_Type",
     "Checked_General?",
     "OpenAlex_Institution_ID",
     "Discovered_Field",
     "General_PI",
+    "PI_Seniority_&_H_Index",
+    "Cold_Email_Keywords",
     "General_Paper",
     "University_Research_Fit",
     "University_Activity",
@@ -1118,11 +1325,32 @@ OUTPUT_COLUMNS = [
     "Top_Faculty_Details",
     "Funding_Evidence_Details",
     "Last_Publication",
+    "Email_Search_Link",
     "Note",
 ]
 
 
+def unify_existing_column_names(df):
+    """
+    If Sheet1 already has columns like 'country', 'rank', or 'qs ranking',
+    rename them to standard names so we populate existing columns instead of duplicating.
+    """
+    rename_map = {}
+    for col in df.columns:
+        low = str(col).strip().lower()
+        if low in ("country", "کشور") and "Country" not in df.columns:
+            rename_map[col] = "Country"
+        elif low in ("ranking", "rank", "qs ranking", "qs_ranking", "رتبه") and "Ranking" not in df.columns:
+            rename_map[col] = "Ranking"
+        elif low in ("city", "شهر") and "City" not in df.columns:
+            rename_map[col] = "City"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
 def ensure_output_columns(df):
+    df = unify_existing_column_names(df)
     for col in OUTPUT_COLUMNS:
         if col not in df.columns:
             if col == "Checked_General?":
@@ -1132,7 +1360,6 @@ def ensure_output_columns(df):
             else:
                 df[col] = ""
         else:
-            # Avoid Pandas 2.x dtype incompatibilities when assigning strings to empty columns
             if col in NUMERIC_OUTPUT_COLUMNS:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
             else:
@@ -1141,10 +1368,6 @@ def ensure_output_columns(df):
 
 
 def sync_duplicate_rows_from_checked(df):
-    """
-    If any row of a university is already marked YES, copy its output columns
-    to all other duplicate rows of that same university so it is never re-queued.
-    """
     checked_mask = df["Checked_General?"].astype(str).str.strip().str.upper() == "YES"
     checked_indices = df.index[checked_mask]
 
@@ -1170,6 +1393,52 @@ def sync_duplicate_rows_from_checked(df):
     return set(source_by_key.keys())
 
 
+def backfill_missing_metadata_for_checked_rows(df):
+    """
+    Backfills Country, City, Ranking, Email_Domain, and PhD_Admission_Type
+    for universities that were already checked in previous runs.
+    """
+    checked_mask = df["Checked_General?"].astype(str).str.strip().str.upper() == "YES"
+    missing_meta_mask = checked_mask & (
+        (df["Country"].astype(str).str.strip() == "")
+        | (df["Ranking"].astype(str).str.strip() == "")
+    )
+
+    indices = df.index[missing_meta_mask]
+    if len(indices) == 0:
+        return
+
+    seen_backfill = {}
+    print(f"--> Backfilling Country & Ranking for {len(indices)} previously checked row(s)...")
+
+    for idx in indices:
+        raw_uni = str(df.at[idx, "University"]).strip()
+        key = university_key(raw_uni)
+        if not key:
+            continue
+
+        if key not in seen_backfill:
+            inst_id = str(df.at[idx, "OpenAlex_Institution_ID"]).strip()
+            if inst_id and inst_id.lower() != "nan":
+                inst = openalex_get(f"/institutions/{inst_id}")
+            else:
+                inst = resolve_institution(raw_uni)
+            seen_backfill[key] = extract_institution_metadata(inst)
+            time.sleep(0.15)
+
+        meta = seen_backfill[key]
+        if meta["country"]:
+            df.at[idx, "Country"] = meta["country"]
+        if meta["city"]:
+            df.at[idx, "City"] = meta["city"]
+        if meta["ranking"]:
+            df.at[idx, "Ranking"] = meta["ranking"]
+        if meta["domain"]:
+            df.at[idx, "Email_Domain"] = meta["domain"]
+        if meta["phd_system"]:
+            df.at[idx, "PhD_Admission_Type"] = meta["phd_system"]
+
+
 def format_faculty_details(faculty):
     if not faculty:
         return ""
@@ -1177,13 +1446,13 @@ def format_faculty_details(faculty):
     chunks = []
     for idx, item in enumerate(faculty, start=1):
         chunks.append(
-            f"{idx}. {item['professor']} | "
-            f"Research={item['research_fit_score']:.1f}/10 | "
+            f"{idx}. {item['professor']} ({item['seniority']}, h={item['prof_h_index']}) | "
+            f"Fit={item['research_fit_score']:.1f}/10 | "
             f"Activity={item['activity_score']:.1f}/10 | "
             f"Funding={item['funding_score']:.1f}/10 | "
             f"Overall={item['faculty_score']:.1f}/10 | "
-            f"Area={', '.join(item['fields'][:3])} | "
-            f"Paper={item['paper'][:100]} ({item['year']})"
+            f"Keywords={item['cold_email_keywords']} | "
+            f"Paper={item['paper'][:95]} ({item['year']})"
         )
     return "\n".join(chunks)
 
@@ -1200,15 +1469,24 @@ def format_funding_details(faculty):
     return "\n".join(chunks)
 
 
-def update_dataframe_row(df, idx, result):
+def update_dataframe_row(df, idx, result, rank_offset=0):
     faculty = result["faculty"]
     institution = result.get("institution") or {}
     inst_id = (institution.get("id") or "").rstrip("/").split("/")[-1]
+    meta = extract_institution_metadata(institution)
+
     df.at[idx, "OpenAlex_Institution_ID"] = inst_id
+    df.at[idx, "Country"] = meta["country"]
+    df.at[idx, "City"] = meta["city"]
+    df.at[idx, "Ranking"] = meta["ranking"]
+    df.at[idx, "Email_Domain"] = meta["domain"]
+    df.at[idx, "PhD_Admission_Type"] = meta["phd_system"]
 
     if not faculty:
         df.at[idx, "Discovered_Field"] = ""
         df.at[idx, "General_PI"] = ""
+        df.at[idx, "PI_Seniority_&_H_Index"] = ""
+        df.at[idx, "Cold_Email_Keywords"] = ""
         df.at[idx, "General_Paper"] = ""
         df.at[idx, "University_Research_Fit"] = 0.0
         df.at[idx, "University_Activity"] = 0.0
@@ -1219,14 +1497,16 @@ def update_dataframe_row(df, idx, result):
         df.at[idx, "Top_Faculty_Details"] = ""
         df.at[idx, "Funding_Evidence_Details"] = ""
         df.at[idx, "Last_Publication"] = ""
+        df.at[idx, "Email_Search_Link"] = ""
         df.at[idx, "Note"] = ""
         return
 
-    top_n = faculty[:MAX_FACULTY_PER_UNIVERSITY]
+    all_matched = faculty[:MAX_FACULTY_PER_UNIVERSITY]
 
-    research_score = sum(x["research_fit_score"] for x in top_n) / len(top_n)
-    activity_score_avg = sum(x["activity_score"] for x in top_n) / len(top_n)
-    funding_score_avg = sum(x["funding_score"] for x in top_n) / len(top_n)
+    top_for_score = all_matched[:5]
+    research_score = sum(x["research_fit_score"] for x in top_for_score) / len(top_for_score)
+    activity_score_avg = sum(x["activity_score"] for x in top_for_score) / len(top_for_score)
+    funding_score_avg = sum(x["funding_score"] for x in top_for_score) / len(top_for_score)
 
     university_score = (
         0.65 * research_score
@@ -1234,31 +1514,34 @@ def update_dataframe_row(df, idx, result):
         + 0.15 * funding_score_avg
     )
 
-    breadth = sum(1 for x in top_n if x["research_fit_score"] >= 6.0)
+    breadth = len(all_matched)
 
     last_pub = max(
-        [x["latest_publication"] for x in top_n if x["latest_publication"]],
+        [x["latest_publication"] for x in all_matched if x["latest_publication"]],
         default="",
     )
 
-    first = top_n[0]
-    df.at[idx, "Discovered_Field"] = first["field"]
-    df.at[idx, "General_PI"] = first["professor"]
-    df.at[idx, "General_Paper"] = f"{first['paper']} ({first['year']})"
+    selected_prof = all_matched[min(rank_offset, len(all_matched) - 1)]
+
+    df.at[idx, "Discovered_Field"] = selected_prof["field"]
+    df.at[idx, "General_PI"] = selected_prof["professor"]
+    df.at[idx, "PI_Seniority_&_H_Index"] = f"{selected_prof['seniority']} (h={selected_prof['prof_h_index']})"
+    df.at[idx, "Cold_Email_Keywords"] = selected_prof["cold_email_keywords"]
+    df.at[idx, "General_Paper"] = f"{selected_prof['paper']} ({selected_prof['year']})"
     df.at[idx, "University_Research_Fit"] = round(research_score, 2)
     df.at[idx, "University_Activity"] = round(activity_score_avg, 2)
     df.at[idx, "University_Funding_Evidence"] = round(funding_score_avg, 2)
     df.at[idx, "University_Score"] = round(university_score, 2)
     df.at[idx, "Faculty_Breadth"] = breadth
-    df.at[idx, "Top_Faculty"] = "; ".join(x["professor"] for x in top_n)
-    df.at[idx, "Top_Faculty_Details"] = format_faculty_details(top_n)
-    df.at[idx, "Funding_Evidence_Details"] = format_funding_details(top_n)
+    df.at[idx, "Top_Faculty"] = "; ".join(x["professor"] for x in all_matched)
+    df.at[idx, "Top_Faculty_Details"] = format_faculty_details(all_matched)
+    df.at[idx, "Funding_Evidence_Details"] = format_funding_details(all_matched)
     df.at[idx, "Last_Publication"] = last_pub
-    df.at[idx, "Note"] = first["profile_url"]
+    df.at[idx, "Email_Search_Link"] = selected_prof["email_finder_url"]
+    df.at[idx, "Note"] = selected_prof["profile_url"]
 
 
 def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
-    """Apply practical formatting and ensure main_sheet_name stays first."""
     try:
         wb = load_workbook(file_name)
         if main_sheet_name in wb.sheetnames and wb.sheetnames[0] != main_sheet_name:
@@ -1277,7 +1560,7 @@ def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
             for col in ws.iter_cols(1, ws.max_column):
                 header = str(col[0].value or "")
                 if "Details" in header or "Evidence" in header:
-                    ws.column_dimensions[col[0].column_letter].width = 55
+                    ws.column_dimensions[col[0].column_letter].width = 58
                     for cell in col[1:]:
                         cell.alignment = cell.alignment.copy(wrap_text=True, vertical="top")
 
@@ -1287,60 +1570,78 @@ def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
 
 
 def build_faculty_rows(processed_results):
-    """One faculty member per row for clean Excel filtering/sorting."""
+    """One faculty member per row with full Cold-Email intelligence."""
     rows = []
     for result in processed_results:
         institution = result.get("institution") or {}
+        meta = extract_institution_metadata(institution)
         uni = result.get("university", "")
         faculty = result.get("faculty", [])
 
         if not faculty:
             rows.append({
                 "University": uni,
+                "Country": meta["country"],
+                "City": meta["city"],
+                "Ranking": meta["ranking"],
+                "Email_Domain": meta["domain"],
+                "PhD_Admission_Type": meta["phd_system"],
                 "Faculty_Rank": "",
                 "Professor": "",
-                "University_OpenAlex": institution.get("display_name", ""),
+                "Seniority_Estimate": "",
+                "Prof_H_Index": 0,
+                "Total_Citations": 0,
                 "Research_Fit": 0,
                 "Activity": 0,
                 "Funding_Evidence": 0,
                 "Overall_Score": 0,
                 "Research_Areas": "",
+                "Cold_Email_Keywords": "",
                 "Matched_Works": 0,
                 "Recent_Works": 0,
                 "Latest_Publication": "",
                 "Best_Paper": "",
                 "Paper_Year": "",
                 "Funding_Evidence_Details": "",
-                "OpenAlex_Profile": "",
+                "Email_Search_Link": "",
                 "Homepage": "",
+                "OpenAlex_Profile": "",
             })
             continue
 
         for rank, item in enumerate(faculty, start=1):
             rows.append({
                 "University": uni,
+                "Country": item.get("country", meta["country"]),
+                "City": item.get("city", meta["city"]),
+                "Ranking": item.get("ranking", meta["ranking"]),
+                "Email_Domain": item.get("email_domain", meta["domain"]),
+                "PhD_Admission_Type": item.get("phd_system", meta["phd_system"]),
                 "Faculty_Rank": rank,
                 "Professor": item.get("professor", ""),
-                "University_OpenAlex": institution.get("display_name", ""),
+                "Seniority_Estimate": item.get("seniority", ""),
+                "Prof_H_Index": item.get("prof_h_index", 0),
+                "Total_Citations": item.get("total_citations", 0),
                 "Research_Fit": item.get("research_fit_score", 0),
                 "Activity": item.get("activity_score", 0),
                 "Funding_Evidence": item.get("funding_score", 0),
                 "Overall_Score": item.get("faculty_score", 0),
                 "Research_Areas": "; ".join(item.get("fields", [])[:3]),
+                "Cold_Email_Keywords": item.get("cold_email_keywords", ""),
                 "Matched_Works": item.get("matched_works_count", 0),
                 "Recent_Works": item.get("recent_works_count", 0),
                 "Latest_Publication": item.get("latest_publication", ""),
                 "Best_Paper": item.get("paper", ""),
                 "Paper_Year": item.get("year", ""),
                 "Funding_Evidence_Details": item.get("funding_evidence", ""),
-                "OpenAlex_Profile": item.get("profile_url", ""),
+                "Email_Search_Link": item.get("email_finder_url", ""),
                 "Homepage": item.get("homepage_url", ""),
+                "OpenAlex_Profile": item.get("profile_url", ""),
             })
     return pd.DataFrame(rows)
 
 
 def save_outputs(df, processed_results, main_sheet_name="Sheet1"):
-    """Save the university tracker and append to the Faculty Results sheet without erasing history."""
     new_faculty_df = build_faculty_rows(processed_results)
 
     if FILE_NAME.endswith(".csv"):
@@ -1360,7 +1661,6 @@ def save_outputs(df, processed_results, main_sheet_name="Sheet1"):
         combined_faculty_df.to_csv(faculty_file, index=False)
         return faculty_file
 
-    # Read existing Faculty Results sheet if it exists so we append instead of wiping
     combined_faculty_df = new_faculty_df
     try:
         wb = load_workbook(FILE_NAME, read_only=True)
@@ -1382,7 +1682,8 @@ def save_outputs(df, processed_results, main_sheet_name="Sheet1"):
         if_sheet_exists="replace",
     ) as writer:
         df.to_excel(writer, sheet_name=main_sheet_name, index=False)
-        combined_faculty_df.to_excel(writer, sheet_name="Faculty Results", index=False)
+        if not combined_faculty_df.empty:
+            combined_faculty_df.to_excel(writer, sheet_name="Faculty Results", index=False)
 
     style_excel_workbook(FILE_NAME, main_sheet_name)
     return FILE_NAME
@@ -1394,62 +1695,82 @@ def save_outputs(df, processed_results, main_sheet_name="Sheet1"):
 
 def build_university_report(universities, all_matches):
     chunks = []
-    current = ["🎯 <b>Faculty Finder v3.1 — Faculty Matches</b>", ""]
+    current = ["🎯 <b>Faculty Finder v3.3 — All Matched Faculty</b>", ""]
 
     def flush():
         nonlocal current
-        if current and len("\n".join(current)) > 0:
+        if current and len("\n".join(current).strip()) > 0:
             chunks.append("\n".join(current))
         current = []
+
+    def append_block(text_block):
+        nonlocal current
+        if len("\n".join(current + [text_block])) > 3500:
+            flush()
+            current = ["🎯 <b>Faculty Finder v3.3 — continued</b>", "", text_block]
+        else:
+            current.append(text_block)
 
     results_by_key = {university_key(item.get("university", "")): item for item in all_matches}
 
     for uni_name in universities:
         uni_result = results_by_key.get(university_key(uni_name), {"university": uni_name, "faculty": []})
-        faculty = uni_result.get("faculty", [])
+        institution = uni_result.get("institution") or {}
+        meta = extract_institution_metadata(institution)
+        faculty = uni_result.get("faculty", [])[:MAX_FACULTY_PER_UNIVERSITY]
 
-        lines = [f"🏛 <b>{html.escape(uni_name)}</b>"]
+        loc_str = f"{meta['city']}, {meta['country']}".strip(", ")
+        rank_str = meta["ranking"]
+        domain_str = meta["domain"]
+
         if not faculty:
-            lines.append("   No strong faculty match found (above threshold).")
-            lines.append("─" * 28)
-        else:
-            top_n = faculty[:MAX_FACULTY_PER_UNIVERSITY]
-            research = sum(x["research_fit_score"] for x in top_n) / len(top_n)
-            activity = sum(x["activity_score"] for x in top_n) / len(top_n)
-            funding = sum(x["funding_score"] for x in top_n) / len(top_n)
-            university_score = 0.65 * research + 0.20 * activity + 0.15 * funding
+            empty_block = (
+                f"🏛 <b>{html.escape(uni_name)}</b> ({html.escape(loc_str)})\n"
+                f"   🏆 {html.escape(rank_str)}\n"
+                f"   No strong faculty match found (above threshold).\n"
+                f"{'─' * 28}"
+            )
+            append_block(empty_block)
+            continue
 
-            lines.extend([
-                f"   ⭐ University score: <b>{university_score:.1f}/10</b> ({len(top_n)} matched PIs)",
-                f"   🎯 Research: {research:.1f} | 📚 Activity: {activity:.1f} | 💰 Funding evidence: {funding:.1f}",
+        top_for_score = faculty[:5]
+        research = sum(x["research_fit_score"] for x in top_for_score) / len(top_for_score)
+        activity = sum(x["activity_score"] for x in top_for_score) / len(top_for_score)
+        funding = sum(x["funding_score"] for x in top_for_score) / len(top_for_score)
+        university_score = 0.65 * research + 0.20 * activity + 0.15 * funding
+
+        uni_header = "\n".join([
+            f"🏛 <b>{html.escape(uni_name)}</b> ({html.escape(loc_str)})",
+            f"   🏆 {html.escape(rank_str)} | 📧 {html.escape(domain_str)}",
+            f"   📋 System: {html.escape(meta['phd_system'])}",
+            f"   ⭐ University score: <b>{university_score:.1f}/10</b> (Matched PIs: <b>{len(faculty)}</b>)",
+            f"   🎯 Research: {research:.1f} | 📚 Activity: {activity:.1f} | 💰 Funding: {funding:.1f}",
+            "",
+        ])
+        append_block(uni_header)
+
+        for rank, item in enumerate(faculty, start=1):
+            professor = html.escape(item.get("professor", ""))
+            seniority = html.escape(item.get("seniority", ""))
+            h_idx = item.get("prof_h_index", 0)
+            keywords = html.escape(item.get("cold_email_keywords", ""))
+            paper = html.escape(item.get("paper", "")[:85])
+            evidence = html.escape(item.get("funding_evidence", "No explicit evidence")[:110])
+            profile = html.escape(item.get("profile_url", ""))
+            email_search = html.escape(item.get("email_finder_url", ""))
+
+            prof_block = "\n".join([
+                f"{rank}. <b>{professor}</b> (h-index: {h_idx} | {seniority})",
+                f"   Fit: {item['research_fit_score']:.1f} | Activity: {item['activity_score']:.1f} | Funding: {item['funding_score']:.1f} | Overall: <b>{item['faculty_score']:.1f}/10</b>",
+                f"   🔑 Keywords: {keywords}",
+                f"   📄 Paper: <i>{paper}</i> ({item.get('year', '')})",
+                f"   💰 Funding: {evidence}",
+                f"   🔗 <a href=\"{profile}\">OpenAlex</a> | <a href=\"{email_search}\">Find Email</a>",
                 "",
             ])
+            append_block(prof_block)
 
-            for rank, item in enumerate(top_n, start=1):
-                professor = html.escape(item.get("professor", ""))
-                fields = html.escape(", ".join(item.get("fields", [])[:2]))
-                paper = html.escape(item.get("paper", "")[:85])
-                evidence = html.escape(item.get("funding_evidence", "No explicit evidence")[:110])
-                profile = html.escape(item.get("profile_url", ""))
-
-                lines.extend([
-                    f"{rank}. <b>{professor}</b>",
-                    f"   Fit: {item['research_fit_score']:.1f} | Activity: {item['activity_score']:.1f} | Funding: {item['funding_score']:.1f} | Overall: <b>{item['faculty_score']:.1f}/10</b>",
-                    f"   Area: {fields}",
-                    f"   Paper: <i>{paper}</i> ({item.get('year', '')})",
-                    f"   Funding: {evidence}",
-                    f"   <a href=\"{profile}\">OpenAlex profile</a>",
-                    "",
-                ])
-
-            lines.append("─" * 28)
-
-        block = "\n".join(lines)
-        if len("\n".join(current + [block])) > 3500:
-            flush()
-            current = ["🎯 <b>Faculty Finder v3.1 — continued</b>", "", block]
-        else:
-            current.append(block)
+        append_block("─" * 28)
 
     flush()
     return chunks
@@ -1466,7 +1787,7 @@ def send_report_chunks(chunks):
 # ==============================================================================
 
 def main():
-    print("🚀 Running Faculty Finder v3.1...")
+    print("🚀 Running Faculty Finder v3.3...")
     print(f"Loading file: {FILE_NAME}")
 
     if not os.path.exists(FILE_NAME):
@@ -1479,7 +1800,6 @@ def main():
             original_sheet_name = "Sheet1"
         else:
             wb = load_workbook(FILE_NAME, read_only=True)
-            # Pick the main tracking sheet (never accidentally load "Faculty Results")
             non_result_sheets = [s for s in wb.sheetnames if s != "Faculty Results"]
             original_sheet_name = non_result_sheets[0] if non_result_sheets else wb.sheetnames[0]
             wb.close()
@@ -1494,10 +1814,10 @@ def main():
 
     df = ensure_output_columns(df)
 
-    # 1. Sync any duplicate rows of universities that already have at least one 'YES' row
+    # 1. Sync duplicate rows & Backfill Country/Ranking for already-checked rows
     already_checked_keys = sync_duplicate_rows_from_checked(df)
+    backfill_missing_metadata_for_checked_rows(df)
 
-    # Also track already-checked OpenAlex Institution IDs to avoid aliases repeating
     checked_inst_ids = {}
     for idx in df.index[df["Checked_General?"].astype(str).str.upper() == "YES"]:
         inst_id = str(df.at[idx, "OpenAlex_Institution_ID"]).strip()
@@ -1525,7 +1845,7 @@ def main():
     if not unique_candidates:
         save_outputs(df, [], original_sheet_name)
         print("[✓] All unique universities have been checked.")
-        send_telegram_html("🎉 <b>Faculty Finder v3.1:</b> all unique universities have been processed.")
+        send_telegram_html("🎉 <b>Faculty Finder v3.3:</b> all unique universities have been processed.")
         return
 
     all_matches = []
@@ -1543,7 +1863,7 @@ def main():
 
         institution = resolve_institution(raw_uni)
         if not institution:
-            print(f"[!] Could not resolve {raw_uni}; marking as checked (unresolved) to prevent infinite retry loop.")
+            print(f"[!] Could not resolve {raw_uni}; marking as checked (unresolved).")
             matching_indices = duplicate_indices_for_university(df, uni_key)
             for idx in matching_indices:
                 df.at[idx, "Checked_General?"] = "YES"
@@ -1553,10 +1873,9 @@ def main():
 
         inst_id = institution["id"].rstrip("/").split("/")[-1]
 
-        # Check if this exact OpenAlex institution was already processed under another name!
         if inst_id in checked_inst_ids:
             src_idx = checked_inst_ids[inst_id]
-            print(f"[!] {raw_uni} resolves to {institution.get('display_name')} ({inst_id}), which was ALREADY checked! Syncing row(s) and skipping.")
+            print(f"[!] {raw_uni} resolves to {institution.get('display_name')} ({inst_id}), ALREADY checked! Syncing.")
             matching_indices = duplicate_indices_for_university(df, uni_key)
             for idx in matching_indices:
                 for col in OUTPUT_COLUMNS:
@@ -1579,8 +1898,8 @@ def main():
         })
 
         matching_indices = duplicate_indices_for_university(df, uni_key)
-        for idx in matching_indices:
-            update_dataframe_row(df, idx, result)
+        for rank_offset, idx in enumerate(matching_indices):
+            update_dataframe_row(df, idx, result, rank_offset=rank_offset)
             df.at[idx, "Checked_General?"] = "YES"
 
         if matching_indices:
@@ -1589,13 +1908,11 @@ def main():
         print(f"[✓] Updated {len(matching_indices)} spreadsheet row(s) for {raw_uni}.")
 
         if result["faculty"]:
-            print(f"[✓] Top {len(result['faculty'])} faculty:")
+            print(f"[✓] Found {len(result['faculty'])} matched PIs:")
             for rank, fac in enumerate(result["faculty"], start=1):
                 print(
-                    f"   {rank}. {fac['professor']} | "
+                    f"   {rank}. {fac['professor']} (h={fac['prof_h_index']}) | "
                     f"Fit={fac['research_fit_score']:.1f} | "
-                    f"Activity={fac['activity_score']:.1f} | "
-                    f"Funding={fac['funding_score']:.1f} | "
                     f"Overall={fac['faculty_score']:.1f} | "
                     f"{fac['field']}"
                 )
@@ -1604,7 +1921,6 @@ def main():
 
         time.sleep(0.5)
 
-    # Save progress
     try:
         faculty_file = save_outputs(df, all_matches, original_sheet_name)
         print(f"\n[✓] Tracking output updated: {FILE_NAME}")
@@ -1621,7 +1937,7 @@ def main():
         send_telegram_document(
             FILE_NAME,
             caption=(
-                f"💾 Faculty Finder v3.1 updated sheet | "
+                f"💾 Faculty Finder v3.3 updated sheet | "
                 f"Processed: {successful_count} new unique universities | "
                 f"Unresolved/Skipped: {failed_count}"
             ),
@@ -1633,7 +1949,7 @@ def main():
                 caption="📋 Row-by-row faculty results (one professor per row).",
             )
     else:
-        send_telegram_html("🎉 <b>Faculty Finder v3.1:</b> All remaining rows were duplicates of already-checked universities and have been synced.")
+        send_telegram_html("🎉 <b>Faculty Finder v3.3:</b> All remaining rows were duplicates of already-checked universities and have been synced.")
 
     print("\n✅ Run complete.")
 
