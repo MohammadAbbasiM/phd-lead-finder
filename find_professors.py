@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import requests
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment
 
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
@@ -36,24 +37,24 @@ else:
     FILE_NAME = "List of emails.xlsx"
 
 BATCH_SIZE = 5                        # بررسی ۵ دانشگاه جدید در هر نوبت اجرا
-MAX_FACULTY_PER_UNIVERSITY = None     # None = بدون محدودیت (یافتن تمام اساتید مرتبط در هر دانشگاه)
-MIN_RESEARCH_FIT_SCORE = 2.5          # حداقل امتیاز تناسب پژوهشی برای گزارش شدن استاد
+MAX_FACULTY_PER_UNIVERSITY = None     # None = بدون محدودیت (یافتن تمام اساتید واقعی در هر دانشگاه)
+MIN_RESEARCH_FIT_SCORE = 3.5          # حداقل امتیاز تناسب پژوهشی استاد (از ۱۰)
 
-# Minimum author profile thresholds to filter out undergraduate/PhD students
-MIN_AUTHOR_WORKS_COUNT = 12
-MIN_AUTHOR_H_INDEX = 4
+# فیلتر سخت‌گیرانه‌تر برای حذف دانشجویان دکتری و پست‌داک‌ها
+MIN_AUTHOR_WORKS_COUNT = 22
+MIN_AUTHOR_H_INDEX = 10
 
 # Recent publication window.
 RECENT_YEARS = 5
 
-# Search breadth (افزایش دامنه جستجو برای پوشش کامل اساتید هر دانشگاه)
+# Search breadth
 WORKS_PER_GROUP = 50
 MAX_CANDIDATE_AUTHORS = 60
 MAX_WORKS_FOR_FIT = 10
 
 # Optional homepage crawl for funding evidence.
 ENABLE_FUNDING_PAGE_CHECK = True
-FUNDING_PAGE_TIMEOUT = 12
+FUNDING_PAGE_TIMEOUT = 10
 MAX_HOMEPAGE_CHARS = 50000
 
 OPENALEX_BASE = "https://api.openalex.org"
@@ -96,7 +97,6 @@ ADMISSION_SYSTEM_BY_COUNTRY = {
     "HK": "HKPFS / University Fellowship + Contact PI",
 }
 
-# رتبه‌بندی مرجع برای دانشگاه‌های شاخص مهندسی و رباتیک (در کنار رتبه محاسباتی OpenAlex)
 KNOWN_QS_RANKS = {
     "massachusetts institute of technology": "QS #1",
     "imperial college london": "QS #2",
@@ -141,6 +141,7 @@ KNOWN_QS_RANKS = {
     "university of glasgow": "QS #78",
     "university of southampton": "QS #80",
     "university of birmingham": "QS #80",
+    "university of bristol": "QS #54",
     "lund university": "QS #75",
     "university of illinois urbana champaign": "QS #69 (Top 10 CS)",
     "georgia institute of technology": "QS #114 (Top 10 Eng)",
@@ -175,10 +176,6 @@ KNOWN_QS_RANKS = {
 
 
 def extract_institution_metadata(institution):
-    """
-    Extract Country, City, Ranking/Tier, Email Domain, and PhD Admission System
-    directly from the OpenAlex Institution object.
-    """
     if not institution:
         return {
             "country": "",
@@ -194,7 +191,6 @@ def extract_institution_metadata(institution):
     country_name = geo.get("country") or COUNTRY_NAMES.get(country_code, country_code)
     city_name = geo.get("city") or ""
 
-    # Email domain from homepage_url
     homepage = institution.get("homepage_url") or ""
     domain = ""
     if homepage:
@@ -206,7 +202,6 @@ def extract_institution_metadata(institution):
         except Exception:
             pass
 
-    # Ranking + OpenAlex Impact Tier
     summary = institution.get("summary_stats") or {}
     h_index = summary.get("h_index", 0) or 0
     display_name = institution.get("display_name", "")
@@ -421,6 +416,20 @@ TIER3_PHRASES = {
     "embedded systems": 1.5,
 }
 
+# کلمات کلیدی پزشکی/کلینیکی برای حذف پزشکان و جراحان هم‌نویسنده (مثل آندوسکوپی گوارش و ارولوژی)
+CLINICAL_EXCLUSION_PHRASES = [
+    "colonoscopy", "endoscopic", "endoscopy", "gastrointestinal", "laparoscopic",
+    "laparoscopy", "urology", "prostate", "oncology", "carcinoma", "histopathology",
+    "radiotherapy", "ophthalmology", "retinal", "cardiovascular", "orthopaedic",
+]
+
+CLINICAL_AUTHOR_DOMAINS = {
+    "gastroenterology", "urology", "surgery", "oncology", "internal medicine",
+    "pathology", "radiology, nuclear medicine and imaging", "ophthalmology",
+    "cardiology and cardiovascular medicine", "obstetrics and gynaecology",
+    "pediatrics, perinatology and child health", "dermatology", "dentistry",
+}
+
 RESEARCH_PROFILE_TEXT = " ".join(
     phrase for _, phrases in SEARCH_GROUPS for phrase in phrases
 )
@@ -455,19 +464,19 @@ FUNDING_MEDIUM = [
 
 
 # ==============================================================================
-# HTTP HELPERS
+# HTTP HELPERS (با مدیریت هوشمند Rate-Limit)
 # ==============================================================================
 
 session = requests.Session()
 session.headers.update(
     {
-        "User-Agent": f"Mozilla/5.0 PhDLeadFinder/3.3 (+mailto:{OPENALEX_EMAIL})",
+        "User-Agent": f"Mozilla/5.0 PhDLeadFinder/3.4 (+mailto:{OPENALEX_EMAIL})",
         "Accept-Language": "en-US,en;q=0.9",
     }
 )
 
 
-def openalex_get(path_or_url, params=None, timeout=20, retries=3):
+def openalex_get(path_or_url, params=None, timeout=25, retries=4):
     if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
         url = path_or_url
     else:
@@ -488,7 +497,11 @@ def openalex_get(path_or_url, params=None, timeout=20, retries=3):
                 return response.json()
 
             if response.status_code in (429, 500, 502, 503, 504):
-                wait = min(10 * (attempt + 1), 30)
+                retry_after = response.headers.get("Retry-After")
+                if retry_after and str(retry_after).isdigit():
+                    wait = int(retry_after) + 1
+                else:
+                    wait = min(5 * (attempt + 1), 20)
                 print(f"    [!] OpenAlex HTTP {response.status_code}; retrying in {wait}s...")
                 time.sleep(wait)
                 continue
@@ -510,7 +523,8 @@ def openalex_get(path_or_url, params=None, timeout=20, retries=3):
 
 def normalize_name(value):
     value = str(value or "").lower()
-    value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+    value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r"[^\w\s]", " ", value)
     return re.sub(r"\s+", " ", value).strip()
 
 
@@ -558,8 +572,7 @@ UNIVERSITY_ALIASES = {
 
 def university_key(name):
     cleaned = clean_university_name(name)
-    normalized = unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode("ascii")
-    normalized = normalize_name(normalized)
+    normalized = normalize_name(cleaned)
     normalized = re.sub(r"^the\s+", "", normalized)
     normalized = re.sub(r"\b(universitaet|universitat|universite|universidad|universita)\b", "university", normalized)
     return UNIVERSITY_ALIASES.get(normalized, normalized)
@@ -606,8 +619,17 @@ def work_text(work):
     return " ".join(parts).strip()
 
 
-def phrase_score(text):
-    lower = normalize_name(text)
+def phrase_score(work):
+    """
+    Computes weighted phrase score with Title Boost and Clinical Penalty.
+    """
+    title_lower = normalize_name(work.get("title", ""))
+    full_lower = normalize_name(work_text(work))
+
+    # Skip purely clinical endoscopy/colonoscopy papers
+    if any(contains_whole_phrase(full_lower, cp) for cp in CLINICAL_EXCLUSION_PHRASES):
+        return 0.0, []
+
     total = 0.0
     matched = []
     has_core_match = False
@@ -615,15 +637,17 @@ def phrase_score(text):
     for tier, mapping in [("T1", TIER1_PHRASES), ("T2", TIER2_PHRASES)]:
         for phrase, weight in mapping.items():
             normalized_phrase = normalize_name(phrase)
-            if contains_whole_phrase(lower, normalized_phrase):
-                total += weight
-                matched.append((phrase, weight, tier))
+            if contains_whole_phrase(full_lower, normalized_phrase):
+                # 1.4x boost if the phrase is directly in the paper title
+                effective_weight = weight * 1.4 if contains_whole_phrase(title_lower, normalized_phrase) else weight
+                total += effective_weight
+                matched.append((phrase, effective_weight, tier))
                 has_core_match = True
 
     t3_hits = []
     for phrase, weight in TIER3_PHRASES.items():
         normalized_phrase = normalize_name(phrase)
-        if contains_whole_phrase(lower, normalized_phrase):
+        if contains_whole_phrase(full_lower, normalized_phrase):
             t3_hits.append((phrase, weight, "T3"))
 
     if has_core_match or len(t3_hits) >= 2:
@@ -640,8 +664,8 @@ def phrase_score(text):
         ("factor graph", "navigation"),
     ]
     for a, b in combo_pairs:
-        if contains_whole_phrase(lower, a) and contains_whole_phrase(lower, b):
-            total += 2.0
+        if contains_whole_phrase(full_lower, a) and contains_whole_phrase(full_lower, b):
+            total += 2.5
 
     matched.sort(key=lambda x: x[1], reverse=True)
     return total, matched
@@ -759,7 +783,7 @@ def resolve_institution(raw_uni_name):
 
 
 # ==============================================================================
-# WORK SEARCH + FACULTY AGGREGATION
+# BATCH AUTHOR FETCHING & PI VERIFICATION (رفع کامل خطای 429 و حذف دانشجویان)
 # ==============================================================================
 
 def build_group_query(keywords):
@@ -775,53 +799,170 @@ def author_belongs_to_institution(authorship, institution_id):
     return False
 
 
+def get_authors_batch(author_ids):
+    """
+    Fetch up to 50 authors per single API request instead of 60 individual requests!
+    Prevents HTTP 429 rate-limit errors completely.
+    """
+    short_ids = [aid.rstrip("/").split("/")[-1] for aid in author_ids if aid]
+    authors_map = {}
+
+    for start in range(0, len(short_ids), 45):
+        chunk = short_ids[start:start + 45]
+        filter_str = "id:" + "|".join(chunk)
+        data = openalex_get(
+            "/authors",
+            params={
+                "filter": filter_str,
+                "per_page": 50,
+            },
+        )
+        if data and data.get("results"):
+            for item in data["results"]:
+                full_id = item.get("id", "")
+                short_id = full_id.rstrip("/").split("/")[-1]
+                authors_map[full_id] = item
+                authors_map[short_id] = item
+        time.sleep(0.25)
+
+    return authors_map
+
+
 def author_currently_at_institution(author_data, target_inst_id):
+    """
+    Strictly verify that the author's primary current affiliation is the target university.
+    Prevents external collaborators (like Cyrill Stachniss at Bonn) from appearing under Oxford.
+    """
     if not author_data:
-        return True
+        return False
 
     target_short = target_inst_id.rstrip("/").split("/")[-1]
 
+    # 1. Check last_known_institutions
     last_insts = author_data.get("last_known_institutions") or []
     if last_insts:
-        for inst in last_insts:
-            inst_id = (inst.get("id") or "").rstrip("/").split("/")[-1]
-            if inst_id == target_short:
-                return True
-        return False
+        matched_in_last = any(
+            (inst.get("id") or "").rstrip("/").split("/")[-1] == target_short
+            for inst in last_insts
+        )
+        if not matched_in_last:
+            return False
 
+    # 2. Check affiliation history to ensure target university is their primary recent base
     affiliations = author_data.get("affiliations") or []
-    current_year = datetime.now(timezone.utc).year
-    for aff in affiliations:
-        inst = aff.get("institution") or {}
-        inst_id = (inst.get("id") or "").rstrip("/").split("/")[-1]
-        years = aff.get("years") or []
-        if inst_id == target_short and any(y >= current_year - 2 for y in years):
-            return True
+    if affiliations:
+        current_year = datetime.now(timezone.utc).year
+        target_recent_years = []
+        other_uni_recent_years = 0
+
+        for aff in affiliations:
+            inst = aff.get("institution") or {}
+            inst_id = (inst.get("id") or "").rstrip("/").split("/")[-1]
+            inst_type = (inst.get("type") or "").lower()
+            years = [y for y in (aff.get("years") or []) if y >= current_year - 3]
+
+            if inst_id == target_short:
+                target_recent_years = years
+            elif inst_type == "education":
+                other_uni_recent_years = max(other_uni_recent_years, len(years))
+
+        # If they haven't published with target_short recently or have stronger recent ties to another university
+        if not target_recent_years and other_uni_recent_years > 0:
+            return False
 
     return True
 
 
-def is_likely_faculty(author_data, senior_paper_count):
+def is_clinical_medical_author(author_data):
+    """Exclude clinical doctors (gastroenterologists, urologists, surgeons) co-authoring imaging papers."""
     if not author_data:
-        return senior_paper_count >= 1
+        return False
+
+    topics = author_data.get("topics") or []
+    clinical_hits = 0
+    engineering_hits = 0
+
+    for t in topics[:6]:
+        sub = ((t.get("subfield") or {}).get("display_name") or "").lower()
+        field = ((t.get("field") or {}).get("display_name") or "").lower()
+        if sub in CLINICAL_AUTHOR_DOMAINS or field == "medicine":
+            clinical_hits += 1
+        if field in ("engineering", "computer science"):
+            engineering_hits += 1
+
+    return clinical_hits >= 2 and engineering_hits == 0
+
+
+def is_likely_faculty(author_data, candidate_rec):
+    """
+    Distinguish true PIs (Professors) from PhD Students and Postdocs.
+    """
+    if not author_data:
+        return False
+
+    if is_clinical_medical_author(author_data):
+        return False
 
     works_count = author_data.get("works_count", 0) or 0
     summary = author_data.get("summary_stats") or {}
     h_index = summary.get("h_index", 0) or 0
 
-    if works_count >= MIN_AUTHOR_WORKS_COUNT and h_index >= MIN_AUTHOR_H_INDEX:
+    if h_index < MIN_AUTHOR_H_INDEX or works_count < MIN_AUTHOR_WORKS_COUNT:
+        return False
+
+    senior_count = candidate_rec.get("senior_author_count", 0)
+    first_count = candidate_rec.get("first_author_count", 0)
+
+    # Professors with h >= 22 are almost certainly established faculty/PIs
+    if h_index >= 22:
         return True
-    if senior_paper_count >= 2 and works_count >= 8:
-        return True
-    return False
+
+    # For mid-range h-index (10..21), a postdoc/PhD student is mostly FIRST author and rarely LAST author.
+    # A genuine Assistant/Associate Professor will appear as LAST/corresponding author on their students' papers.
+    if senior_count == 0 and first_count >= 1:
+        return False
+
+    if h_index < 14 and senior_count < 2:
+        return False
+
+    return True
 
 
 def estimate_seniority(h_index, works_count):
-    if h_index >= 30 or works_count >= 150:
+    if h_index >= 32 or works_count >= 160:
         return "Full / Senior Prof (Large Lab)"
-    if h_index >= 14 or works_count >= 50:
+    if h_index >= 18 or works_count >= 65:
         return "Associate / Established PI (High Fit)"
     return "Assistant Prof / Rising Star (Responsive)"
+
+
+def merge_duplicate_author_candidates(author_stats):
+    """
+    Merge split OpenAlex profiles that belong to the same person in the same university
+    (e.g., two 'Andrew J. Davison' profiles at Imperial College London).
+    """
+    by_norm_name = {}
+    for author_id, rec in author_stats.items():
+        norm = normalize_name(rec["professor"])
+        if not norm:
+            continue
+
+        if norm not in by_norm_name:
+            by_norm_name[norm] = rec
+        else:
+            primary = by_norm_name[norm]
+            # Merge matched works
+            for wid, wdata in rec["matched_works"].items():
+                if wid not in primary["matched_works"] or wdata["fit"] > primary["matched_works"][wid]["fit"]:
+                    primary["matched_works"][wid] = wdata
+            # Merge fields
+            for f, fscore in rec["fields"].items():
+                primary["fields"][f] = primary["fields"].get(f, 0.0) + fscore
+            primary["senior_author_count"] += rec["senior_author_count"]
+            primary["first_author_count"] += rec["first_author_count"]
+            primary["all_author_ids"].extend(rec["all_author_ids"])
+
+    return by_norm_name
 
 
 def search_faculty_broad(raw_uni_name, institution=None):
@@ -857,6 +998,8 @@ def search_faculty_broad(raw_uni_name, institution=None):
                 ),
             },
         )
+        # Polite pause between group queries to avoid HTTP 429 burst limits
+        time.sleep(0.22)
 
         if not data:
             continue
@@ -883,18 +1026,31 @@ def search_faculty_broad(raw_uni_name, institution=None):
 
     for idx, item in enumerate(work_records):
         work = item["work"]
-        text = texts[idx]
-
-        weighted_score, matched = phrase_score(text)
+        weighted_score, matched = phrase_score(work)
         if weighted_score <= 0:
             continue
 
-        keyword_norm = min(weighted_score / 45.0, 1.0)
+        # Fair normalization: papers without open abstracts in OpenAlex shouldn't be penalized by 45.0 divisor
+        has_abstract = bool(work.get("abstract_inverted_index"))
+        norm_divisor = 26.0 if has_abstract else 15.0
+        keyword_norm = min(weighted_score / norm_divisor, 1.0)
         similarity_norm = min(sims[idx] * 3.0, 1.0)
 
         base_fit = 0.85 * keyword_norm + 0.15 * similarity_norm
         recency = recency_factor(work.get("publication_date"))
-        contribution = base_fit * (0.70 + 0.30 * recency)
+        contribution = base_fit * (0.75 + 0.25 * recency)
+
+        # Assign the work's true best-matching group based on its actual content
+        work_full_lower = normalize_name(texts[idx])
+        best_group_for_work = None
+        best_group_hits = 0
+        for g_label, g_keywords in SEARCH_GROUPS:
+            hits = sum(1 for kw in g_keywords if contains_whole_phrase(work_full_lower, normalize_name(kw)))
+            if hits > best_group_hits:
+                best_group_hits = hits
+                best_group_for_work = g_label
+
+        assigned_fields = {best_group_for_work} if best_group_for_work else item["fields"]
 
         for authorship in work.get("authorships") or []:
             if not author_belongs_to_institution(authorship, inst_id):
@@ -910,16 +1066,20 @@ def search_faculty_broad(raw_uni_name, institution=None):
             if author_id not in author_stats:
                 author_stats[author_id] = {
                     "author_id": author_id,
+                    "all_author_ids": [author_id],
                     "professor": author_name,
                     "matched_works": {},
                     "fields": {},
                     "senior_author_count": 0,
+                    "first_author_count": 0,
                 }
 
             pos = authorship.get("author_position", "")
             is_corr = authorship.get("is_corresponding", False)
             if pos == "last" or is_corr:
                 author_stats[author_id]["senior_author_count"] += 1
+            elif pos == "first":
+                author_stats[author_id]["first_author_count"] += 1
 
             author_stats[author_id]["matched_works"][work.get("id")] = {
                 "title": work.get("title", "N/A"),
@@ -931,12 +1091,15 @@ def search_faculty_broad(raw_uni_name, institution=None):
                 "matched_phrases": [x[0] for x in matched[:8]],
             }
 
-            for field in item["fields"]:
+            for field in assigned_fields:
                 author_stats[author_id]["fields"][field] = (
-                    author_stats[author_id]["fields"].get(field, 0) + contribution
+                    author_stats[author_id]["fields"].get(field, 0.0) + contribution
                 )
 
-    for author_id, rec in author_stats.items():
+    # Deduplicate split author profiles by normalized name
+    merged_candidates = list(merge_duplicate_author_candidates(author_stats).values())
+
+    for rec in merged_candidates:
         works = list(rec["matched_works"].values())
         if not works:
             rec["pre_score"] = 0.0
@@ -945,52 +1108,63 @@ def search_faculty_broad(raw_uni_name, institution=None):
         total_fit = sum(w["fit"] for w in works)
         best_fit = max(w["raw_fit"] for w in works)
         breadth = len(rec["fields"])
-        senior_bonus = min(rec["senior_author_count"] * 0.4, 1.5)
+        senior_bonus = min(rec["senior_author_count"] * 0.5, 2.0)
 
         rec["pre_score"] = (
-            min(total_fit / 4.0, 5.0)
+            min(total_fit / 3.5, 5.0)
             + min(best_fit * 4.0, 4.0)
             + min(breadth * 0.25, 1.0)
             + senior_bonus
         )
 
     top_candidates = sorted(
-        author_stats.values(),
+        merged_candidates,
         key=lambda x: x["pre_score"],
         reverse=True,
     )[:MAX_CANDIDATE_AUTHORS]
 
+    # Batch-fetch all author details in 1-2 API calls instead of 60 individual calls!
+    all_ids_to_fetch = []
+    for rec in top_candidates:
+        all_ids_to_fetch.extend(rec["all_author_ids"])
+    authors_map = get_authors_batch(all_ids_to_fetch)
+
     faculty = []
     for rec in top_candidates:
-        author_data = get_author_details(rec["author_id"]) or {}
+        # Pick the richest OpenAlex profile if the author had split IDs
+        best_author_data = {}
+        best_h = -1
+        for aid in rec["all_author_ids"]:
+            short_aid = aid.rstrip("/").split("/")[-1]
+            adata = authors_map.get(aid) or authors_map.get(short_aid) or {}
+            h_val = ((adata.get("summary_stats") or {}).get("h_index", 0)) or 0
+            if h_val > best_h:
+                best_h = h_val
+                best_author_data = adata
 
-        if not author_currently_at_institution(author_data, inst_id):
+        if not best_author_data:
             continue
 
-        if not is_likely_faculty(author_data, rec["senior_author_count"]):
+        # 1. Verify author is genuinely at this university (blocks external co-authors like Bonn at Oxford)
+        if not author_currently_at_institution(best_author_data, inst_id):
             continue
 
-        recent_author_works = get_recent_author_works(
-            rec["author_id"],
-            recent_year_start(),
-            per_page=25,
-        )
+        # 2. Verify author is a Professor/PI (blocks PhD students, postdocs, and clinical doctors)
+        if not is_likely_faculty(best_author_data, rec):
+            continue
 
         enriched = score_faculty_record(
             raw_uni_name=raw_uni_name,
             institution=institution,
             candidate=rec,
-            author_data=author_data,
-            recent_author_works=recent_author_works,
+            author_data=best_author_data,
         )
 
         if enriched["research_fit_score"] >= MIN_RESEARCH_FIT_SCORE:
             faculty.append(enriched)
 
-        time.sleep(0.15)
-
     faculty.sort(
-        key=lambda x: x["faculty_score"],
+        key=lambda x: (x["faculty_score"], x["prof_h_index"]),
         reverse=True,
     )
 
@@ -1001,66 +1175,44 @@ def search_faculty_broad(raw_uni_name, institution=None):
     }
 
 
-def get_author_details(author_id):
-    return openalex_get(
-        f"/authors/{author_id.rstrip('/').split('/')[-1]}",
-        timeout=15,
-    )
-
-
-def get_recent_author_works(author_id, start_date, per_page=25):
-    data = openalex_get(
-        "/works",
-        params={
-            "filter": (
-                f"author.id:{author_id.rstrip('/').split('/')[-1]},"
-                f"from_publication_date:{start_date}"
-            ),
-            "sort": "publication_date:desc",
-            "per_page": per_page,
-            "select": (
-                "id,title,publication_date,publication_year,cited_by_count,"
-                "authorships"
-            ),
-        },
-        timeout=18,
-    )
-    return (data or {}).get("results", [])
-
-
 # ==============================================================================
-# FACULTY SCORING
+# FACULTY SCORING (بدون نیاز به درخواست اضافی برای هر استاد)
 # ==============================================================================
 
-def activity_score(recent_works):
-    count = len(recent_works)
+def activity_score_from_author_data(author_data, matched_works):
+    """
+    Calculate recent 5-year activity directly from author's counts_by_year in author_data,
+    eliminating 60 extra '/works' API calls per university!
+    """
+    current_year = datetime.now(timezone.utc).year
+    counts_by_year = author_data.get("counts_by_year") or []
+    recent_total = sum(
+        item.get("works_count", 0)
+        for item in counts_by_year
+        if (item.get("year") or 0) >= current_year - RECENT_YEARS
+    )
 
-    if count >= 10:
+    if recent_total >= 15:
         count_score = 10.0
-    elif count >= 7:
+    elif recent_total >= 10:
         count_score = 9.0
-    elif count >= 5:
+    elif recent_total >= 6:
         count_score = 8.0
-    elif count >= 3:
+    elif recent_total >= 3:
         count_score = 6.5
-    elif count >= 2:
+    elif recent_total >= 1:
         count_score = 5.0
-    elif count == 1:
-        count_score = 3.0
     else:
-        count_score = 0.0
+        count_score = 3.0
 
-    latest_date = ""
-    if recent_works:
-        latest_date = max(
-            [w.get("publication_date", "") for w in recent_works if w.get("publication_date", "")],
-            default="",
-        )
-
+    latest_date = max(
+        [w.get("publication_date", "") for w in matched_works if w.get("publication_date", "")],
+        default="",
+    )
     latest_factor = recency_factor(latest_date)
     latest_score = latest_factor * 10.0
 
-    return round(0.65 * count_score + 0.35 * latest_score, 2), latest_date
+    return round(0.65 * count_score + 0.35 * latest_score, 2), latest_date, recent_total
 
 
 def detect_funding_from_homepage(homepage_url):
@@ -1123,7 +1275,6 @@ def score_faculty_record(
     institution,
     candidate,
     author_data,
-    recent_author_works,
 ):
     matched_works = list(candidate["matched_works"].values())
     matched_works.sort(
@@ -1140,11 +1291,14 @@ def score_faculty_record(
     if top_fit_values:
         best = max(top_fit_values)
         mean_top = sum(top_fit_values) / len(top_fit_values)
-        research_score = min((0.60 * best + 0.40 * mean_top) * 10.0, 10.0)
+        volume_bonus = min(len(matched_works) * 0.03, 0.15)
+        research_score = min((0.65 * best + 0.35 * mean_top + volume_bonus) * 10.0, 10.0)
     else:
         research_score = 0.0
 
-    activity, latest_publication = activity_score(recent_author_works)
+    activity, latest_publication, recent_works_count = activity_score_from_author_data(
+        author_data, matched_works
+    )
     homepage_url = author_data.get("homepage_url") or ""
     funding = detect_funding_from_homepage(homepage_url)
 
@@ -1164,14 +1318,12 @@ def score_faculty_record(
         )[:3]
     ]
 
-    # Collect unique matched phrases across top works for Cold Email writing
     hook_phrases = []
     for w in matched_works[:5]:
         for p in w.get("matched_phrases", []):
             if p not in hook_phrases:
                 hook_phrases.append(p)
 
-    # Extract Professor H-index, Citations, and Seniority
     summary_stats = author_data.get("summary_stats") or {}
     prof_h_index = summary_stats.get("h_index", 0) or 0
     total_works = author_data.get("works_count", 0) or 0
@@ -1180,12 +1332,12 @@ def score_faculty_record(
 
     meta = extract_institution_metadata(institution)
     domain_clean = meta["domain"].lstrip("@")
-    prof_name = candidate["professor"]
+    prof_name = author_data.get("display_name") or candidate["professor"]
     if domain_clean:
         search_q = f'site:{domain_clean} "{prof_name}" email'
     else:
         search_q = f'"{prof_name}" "{raw_uni_name}" email'
-    email_finder_url = f"https://www.google.com/search?q={ requests.utils.quote(search_q) }"
+    email_finder_url = f"https://www.google.com/search?q={requests.utils.quote(search_q)}"
 
     top_work = matched_works[0] if matched_works else {}
     recent_title = top_work.get("title", "N/A")
@@ -1206,7 +1358,7 @@ def score_faculty_record(
         "seniority": seniority,
         "cold_email_keywords": ", ".join(hook_phrases[:6]),
         "email_finder_url": email_finder_url,
-        "author_id": candidate["author_id"],
+        "author_id": author_data.get("id", candidate["author_id"]),
         "profile_url": author_data.get("id", candidate["author_id"]),
         "homepage_url": homepage_url,
         "paper": recent_title,
@@ -1216,7 +1368,7 @@ def score_faculty_record(
         "funding_score": round(funding["score"], 2),
         "faculty_score": round(faculty_score, 2),
         "matched_works_count": len(matched_works),
-        "recent_works_count": len(recent_author_works),
+        "recent_works_count": recent_works_count,
         "latest_publication": latest_publication,
         "funding_evidence": funding["evidence"],
         "funding_url": funding["url"],
@@ -1331,10 +1483,6 @@ OUTPUT_COLUMNS = [
 
 
 def unify_existing_column_names(df):
-    """
-    If Sheet1 already has columns like 'country', 'rank', or 'qs ranking',
-    rename them to standard names so we populate existing columns instead of duplicating.
-    """
     rename_map = {}
     for col in df.columns:
         low = str(col).strip().lower()
@@ -1394,10 +1542,6 @@ def sync_duplicate_rows_from_checked(df):
 
 
 def backfill_missing_metadata_for_checked_rows(df):
-    """
-    Backfills Country, City, Ranking, Email_Domain, and PhD_Admission_Type
-    for universities that were already checked in previous runs.
-    """
     checked_mask = df["Checked_General?"].astype(str).str.strip().str.upper() == "YES"
     missing_meta_mask = checked_mask & (
         (df["Country"].astype(str).str.strip() == "")
@@ -1424,7 +1568,7 @@ def backfill_missing_metadata_for_checked_rows(df):
             else:
                 inst = resolve_institution(raw_uni)
             seen_backfill[key] = extract_institution_metadata(inst)
-            time.sleep(0.15)
+            time.sleep(0.2)
 
         meta = seen_backfill[key]
         if meta["country"]:
@@ -1542,10 +1686,13 @@ def update_dataframe_row(df, idx, result, rank_offset=0):
 
 
 def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
+    """Apply clean Excel formatting without triggering openpyxl DeprecationWarning."""
     try:
         wb = load_workbook(file_name)
         if main_sheet_name in wb.sheetnames and wb.sheetnames[0] != main_sheet_name:
             wb.move_sheet(main_sheet_name, offset=-wb.sheetnames.index(main_sheet_name))
+
+        wrapped_top_alignment = Alignment(wrap_text=True, vertical="top")
 
         for ws in wb.worksheets:
             ws.freeze_panes = "A2"
@@ -1562,7 +1709,7 @@ def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
                 if "Details" in header or "Evidence" in header:
                     ws.column_dimensions[col[0].column_letter].width = 58
                     for cell in col[1:]:
-                        cell.alignment = cell.alignment.copy(wrap_text=True, vertical="top")
+                        cell.alignment = wrapped_top_alignment
 
         wb.save(file_name)
     except Exception as exc:
@@ -1570,7 +1717,6 @@ def style_excel_workbook(file_name, main_sheet_name="Sheet1"):
 
 
 def build_faculty_rows(processed_results):
-    """One faculty member per row with full Cold-Email intelligence."""
     rows = []
     for result in processed_results:
         institution = result.get("institution") or {}
@@ -1695,7 +1841,7 @@ def save_outputs(df, processed_results, main_sheet_name="Sheet1"):
 
 def build_university_report(universities, all_matches):
     chunks = []
-    current = ["🎯 <b>Faculty Finder v3.3 — All Matched Faculty</b>", ""]
+    current = ["🎯 <b>Faculty Finder v3.4 — Verified Faculty & PIs</b>", ""]
 
     def flush():
         nonlocal current
@@ -1707,7 +1853,7 @@ def build_university_report(universities, all_matches):
         nonlocal current
         if len("\n".join(current + [text_block])) > 3500:
             flush()
-            current = ["🎯 <b>Faculty Finder v3.3 — continued</b>", "", text_block]
+            current = ["🎯 <b>Faculty Finder v3.4 — continued</b>", "", text_block]
         else:
             current.append(text_block)
 
@@ -1743,7 +1889,7 @@ def build_university_report(universities, all_matches):
             f"🏛 <b>{html.escape(uni_name)}</b> ({html.escape(loc_str)})",
             f"   🏆 {html.escape(rank_str)} | 📧 {html.escape(domain_str)}",
             f"   📋 System: {html.escape(meta['phd_system'])}",
-            f"   ⭐ University score: <b>{university_score:.1f}/10</b> (Matched PIs: <b>{len(faculty)}</b>)",
+            f"   ⭐ University score: <b>{university_score:.1f}/10</b> (Verified PIs: <b>{len(faculty)}</b>)",
             f"   🎯 Research: {research:.1f} | 📚 Activity: {activity:.1f} | 💰 Funding: {funding:.1f}",
             "",
         ])
@@ -1787,7 +1933,7 @@ def send_report_chunks(chunks):
 # ==============================================================================
 
 def main():
-    print("🚀 Running Faculty Finder v3.3...")
+    print("🚀 Running Faculty Finder v3.4...")
     print(f"Loading file: {FILE_NAME}")
 
     if not os.path.exists(FILE_NAME):
@@ -1814,7 +1960,6 @@ def main():
 
     df = ensure_output_columns(df)
 
-    # 1. Sync duplicate rows & Backfill Country/Ranking for already-checked rows
     already_checked_keys = sync_duplicate_rows_from_checked(df)
     backfill_missing_metadata_for_checked_rows(df)
 
@@ -1824,7 +1969,6 @@ def main():
         if inst_id and inst_id.lower() != "nan":
             checked_inst_ids[inst_id] = idx
 
-    # 2. Filter remaining unchecked rows
     mask = (
         df["University"].notna()
         & (df["University"].astype(str).str.strip() != "")
@@ -1845,7 +1989,7 @@ def main():
     if not unique_candidates:
         save_outputs(df, [], original_sheet_name)
         print("[✓] All unique universities have been checked.")
-        send_telegram_html("🎉 <b>Faculty Finder v3.3:</b> all unique universities have been processed.")
+        send_telegram_html("🎉 <b>Faculty Finder v3.4:</b> all unique universities have been processed.")
         return
 
     all_matches = []
@@ -1908,7 +2052,7 @@ def main():
         print(f"[✓] Updated {len(matching_indices)} spreadsheet row(s) for {raw_uni}.")
 
         if result["faculty"]:
-            print(f"[✓] Found {len(result['faculty'])} matched PIs:")
+            print(f"[✓] Found {len(result['faculty'])} verified PIs:")
             for rank, fac in enumerate(result["faculty"], start=1):
                 print(
                     f"   {rank}. {fac['professor']} (h={fac['prof_h_index']}) | "
@@ -1937,7 +2081,7 @@ def main():
         send_telegram_document(
             FILE_NAME,
             caption=(
-                f"💾 Faculty Finder v3.3 updated sheet | "
+                f"💾 Faculty Finder v3.4 updated sheet | "
                 f"Processed: {successful_count} new unique universities | "
                 f"Unresolved/Skipped: {failed_count}"
             ),
@@ -1949,7 +2093,7 @@ def main():
                 caption="📋 Row-by-row faculty results (one professor per row).",
             )
     else:
-        send_telegram_html("🎉 <b>Faculty Finder v3.3:</b> All remaining rows were duplicates of already-checked universities and have been synced.")
+        send_telegram_html("🎉 <b>Faculty Finder v3.4:</b> All remaining rows were duplicates of already-checked universities and have been synced.")
 
     print("\n✅ Run complete.")
 
